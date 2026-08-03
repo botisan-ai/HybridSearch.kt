@@ -2,8 +2,7 @@ package ai.botisan.hybridsearch
 
 import ai.botisan.hnsw.HnswDistanceType
 import java.io.File
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
+import java.io.FileOutputStream
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.int
@@ -72,8 +71,16 @@ internal object HybridMetadataStore {
             put("schemaFingerprint", metadata.schemaFingerprint)
         }
         val tmp = File(file.parentFile, "${file.name}.tmp")
-        tmp.writeText(obj.toString())
-        Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        FileOutputStream(tmp).use { out ->
+            out.write(obj.toString().toByteArray(Charsets.UTF_8))
+            out.fd.sync()
+        }
+        // POSIX rename(2) atomically replaces within a directory and is
+        // available on API 24 (java.nio.file needs API 26).
+        if (!tmp.renameTo(file)) {
+            tmp.delete()
+            throw HybridSearchException.MetadataCorrupt("could not atomically replace ${file.absolutePath}")
+        }
     }
 
     fun load(file: File): HybridIndexMetadata {

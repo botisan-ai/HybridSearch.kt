@@ -22,6 +22,16 @@ public sealed class HybridSearchException(message: String) : Exception(message) 
         HybridSearchException("Embedding dimension mismatch: expected=$expected, got=$got")
 
     public class MissingDocId : HybridSearchException("Stored document has no __doc_id field")
+
+    /** The schema or adapter used the reserved internal `__doc_id` field. */
+    public class ReservedField(public val name: String) :
+        HybridSearchException("'$name' is reserved for HybridIndex internals")
+
+    /** Every document must carry exactly one value for the primary id field. */
+    public class InvalidPrimaryIdValue(public val field: String, public val count: Int) :
+        HybridSearchException("Document must carry exactly one '$field' value (got $count)")
+
+    public class AlreadyClosed : HybridSearchException("Index is closed")
 }
 
 /** Mirrors HybridSearch.swift's `HybridIndexConfig` defaults (384-d cosine). */
@@ -33,6 +43,16 @@ public data class HybridIndexConfig(
     val hnswEfConstruction: Int = 200,
     val distanceType: HnswDistanceType = HnswDistanceType.COSINE,
 ) {
+    init {
+        // Same bounds HnswConfig enforces — checked here so an invalid config
+        // fails at construction, not at first use.
+        require(embeddingDimension >= 1) { "embeddingDimension must be >= 1 (got $embeddingDimension)" }
+        require(hnswMaxConnections in 1..256) { "hnswMaxConnections must be in 1..256 (got $hnswMaxConnections)" }
+        require(hnswMaxElements >= 1) { "hnswMaxElements must be >= 1 (got $hnswMaxElements)" }
+        require(hnswMaxLayers in 1..16) { "hnswMaxLayers must be in 1..16 (got $hnswMaxLayers)" }
+        require(hnswEfConstruction >= 1) { "hnswEfConstruction must be >= 1 (got $hnswEfConstruction)" }
+    }
+
     internal fun hnswConfig(): HnswConfig = HnswConfig(
         maxConnections = hnswMaxConnections,
         maxElements = hnswMaxElements,
@@ -41,6 +61,17 @@ public data class HybridIndexConfig(
         dimension = embeddingDimension,
         distanceType = distanceType,
     )
+}
+
+/** A document plus its embedding — the unit [HybridIndex.addAll]/[HybridIndex.indexAll] consume. */
+public data class HybridDocument<T>(
+    val document: T,
+    val embedding: FloatArray,
+) {
+    override fun equals(other: Any?): Boolean =
+        other is HybridDocument<*> && document == other.document && embedding.contentEquals(other.embedding)
+
+    override fun hashCode(): Int = 31 * (document?.hashCode() ?: 0) + embedding.contentHashCode()
 }
 
 public data class HybridSearchResult<T>(
