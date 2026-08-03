@@ -1,21 +1,37 @@
 #!/bin/bash
 # Publishes a GitHub Release: zipped Maven repo (AAR + POM + module metadata) + bare AAR, each with SHA-256.
 # Version comes from android/gradle.properties.
+#
+# Zip layout: the zip root IS the Maven repository root (ai/botisan/...), so
+# consumers can point Gradle straight at the unzip directory.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 ARTIFACT="hybridsearch-android"
 VERSION=$(grep '^version=' android/gradle.properties | cut -d= -f2)
 
-echo "==> test + assemble + publish $ARTIFACT $VERSION"
-(cd android && ./gradlew --console=plain test assembleRelease publishReleasePublicationToBuildDirRepository)
+echo "==> release gates (test + lintRelease + assembleRelease)"
+(cd android && ./gradlew --console=plain test lintRelease assembleRelease)
+
+echo "==> publishing $ARTIFACT $VERSION to a fresh local maven layout"
+rm -rf android/build/maven-repo
+(cd android && ./gradlew --console=plain publishReleasePublicationToBuildDirRepository)
 
 STAGING=$(mktemp -d)
 trap 'rm -rf "$STAGING"' EXIT
 
-cp -R android/build/maven-repo "$STAGING/maven-repo"
-(cd "$STAGING" && zip -qr "$ARTIFACT-$VERSION-maven.zip" maven-repo)
+(cd android/build/maven-repo && zip -qr "$STAGING/$ARTIFACT-$VERSION-maven.zip" .)
 cp "android/lib/build/outputs/aar/lib-release.aar" "$STAGING/$ARTIFACT-$VERSION.aar"
+
+echo "==> asserting zip layout resolves the documented Maven path"
+if ! unzip -l "$STAGING/$ARTIFACT-$VERSION-maven.zip" | grep -q "ai/botisan/$ARTIFACT/$VERSION/$ARTIFACT-$VERSION.aar"; then
+  echo "FAIL: maven zip does not contain ai/botisan/$ARTIFACT/$VERSION/$ARTIFACT-$VERSION.aar at its root" >&2
+  exit 1
+fi
+if unzip -l "$STAGING/$ARTIFACT-$VERSION-maven.zip" | grep -q " maven-repo/"; then
+  echo "FAIL: maven zip contains a maven-repo/ wrapper directory" >&2
+  exit 1
+fi
 
 (cd "$STAGING" \
   && shasum -a 256 "$ARTIFACT-$VERSION-maven.zip" > "$ARTIFACT-$VERSION-maven.zip.sha256" \
