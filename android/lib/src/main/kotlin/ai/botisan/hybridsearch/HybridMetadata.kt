@@ -4,6 +4,7 @@ import ai.botisan.hnsw.HnswDistanceType
 import java.io.File
 import java.io.FileOutputStream
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
@@ -13,9 +14,12 @@ import kotlinx.serialization.json.put
 
 /**
  * `hybrid.meta.json` — same shape as HybridSearch.swift's metadata (version 1,
- * camelCase keys, distance types as "l2"/"cosine"/"dot"/"l1"). The
- * schemaFingerprint format differs (derived from the Kotlin schema DSL, not
- * Swift reflection), so index directories are not cross-language portable.
+ * camelCase keys, distance types as "l2"/"cosine"/"dot"/"l1") plus the
+ * Kotlin-only `hasVectorGraph` marker: the committed record of whether HNSW
+ * files must exist on disk, so a missing graph is distinguishable corruption
+ * rather than silently an empty index. The schemaFingerprint format also
+ * differs (derived from the Kotlin schema DSL, not Swift reflection), so index
+ * directories were never cross-language portable.
  */
 internal data class HybridIndexMetadata(
     val version: Int,
@@ -28,6 +32,7 @@ internal data class HybridIndexMetadata(
     val nextDocId: Long,
     val primaryIdField: String,
     val schemaFingerprint: String,
+    val hasVectorGraph: Boolean,
 ) {
     companion object {
         const val CURRENT_VERSION = 1
@@ -69,6 +74,7 @@ internal object HybridMetadataStore {
             put("nextDocId", metadata.nextDocId)
             put("primaryIdField", metadata.primaryIdField)
             put("schemaFingerprint", metadata.schemaFingerprint)
+            put("hasVectorGraph", metadata.hasVectorGraph)
         }
         val tmp = File(file.parentFile, "${file.name}.tmp")
         FileOutputStream(tmp).use { out ->
@@ -102,6 +108,7 @@ internal object HybridMetadataStore {
                 nextDocId = root.getValue("nextDocId").jsonPrimitive.long,
                 primaryIdField = root.getValue("primaryIdField").jsonPrimitive.content,
                 schemaFingerprint = root.getValue("schemaFingerprint").jsonPrimitive.content,
+                hasVectorGraph = root.getValue("hasVectorGraph").jsonPrimitive.boolean,
             )
         } catch (e: HybridSearchException) {
             throw e

@@ -257,30 +257,43 @@ class HybridIndexTest {
 
     // -- HY4: compound operations hold one lock -----------------------------------
 
+    /** Adapter whose encode signals `entered` and parks until `release` for the given doc id. */
+    private class GatedAdapter(
+        private val gatedId: String,
+        val entered: CountDownLatch = CountDownLatch(1),
+        val release: CountDownLatch = CountDownLatch(1),
+    ) : TantivyDocumentAdapter<TestDoc> {
+        override fun encode(value: TestDoc, doc: TantivyDocumentWriter) {
+            if (value.id == gatedId) {
+                entered.countDown()
+                check(release.await(10, TimeUnit.SECONDS)) { "release latch timed out" }
+            }
+            TestDocAdapter.encode(value, doc)
+        }
+
+        override fun decode(fields: TantivyFieldMap): TestDoc = TestDocAdapter.decode(fields)
+    }
+
     @Test
     fun indexCommitCannotSweepInAConcurrentUncommittedAdd() = runBlocking {
         val path = tempPath()
-        val slowGate = CountDownLatch(1)
-        val slowAdapter = object : TantivyDocumentAdapter<TestDoc> {
-            override fun encode(value: TestDoc, doc: TantivyDocumentWriter) {
-                if (value.id == "slow-1") slowGate.await(5, TimeUnit.SECONDS)
-                TestDocAdapter.encode(value, doc)
-            }
+        val adapter = GatedAdapter("slow-1")
 
-            override fun decode(fields: TantivyFieldMap): TestDoc = TestDocAdapter.decode(fields)
-        }
-
-        HybridIndex.create(path, schema, slowAdapter, config).use { index ->
+        HybridIndex.create(path, schema, adapter, config).use { index ->
             val slowDoc = TestDoc("slow-1", "Slow Doc", "held open by the test", true)
             val indexJob = launch(Dispatchers.Default) {
                 index.index(slowDoc, TestEmbeddings.docSwiftConcurrency)
             }
-            delay(100) // let index() take the lock and park inside encode
+            // Barrier: index() holds the mutex and is parked inside encode.
+            assertTrue(adapter.entered.await(10, TimeUnit.SECONDS))
             val addJob = launch(Dispatchers.Default) {
-                index.add(docs[1].document, docs[1].embedding) // must queue behind index()'s whole add+commit
+                index.add(docs[1].document, docs[1].embedding)
             }
-            delay(100)
-            slowGate.countDown()
+            // The mutex is held for index()'s whole add+commit, so the add
+            // cannot have completed no matter how the scheduler runs it.
+            delay(50)
+            assertFalse(addJob.isCompleted)
+            adapter.release.countDown()
             indexJob.join()
             addJob.join()
         }
@@ -291,6 +304,40 @@ class HybridIndexTest {
             assertEquals(1L, reopened.count())
             assertNotNull(reopened.get("id", TantivyValue.Text("slow-1")))
             assertNull(reopened.get("id", TantivyValue.Text("rust-1")))
+        }
+    }
+
+    @Test
+    fun deleteByFieldQueuesBehindACompoundIndexOperation() = runBlocking {
+        val path = tempPath()
+        val adapter = GatedAdapter("slow-2")
+
+        HybridIndex.create(path, schema, adapter, config).use { index ->
+            index.index(docs[0].document, docs[0].embedding) // "swift-1", committed
+            val slowDoc = TestDoc("slow-2", "Slow Doc 2", "held open by the test", true)
+            val indexJob = launch(Dispatchers.Default) {
+                index.index(slowDoc, TestEmbeddings.docRustFfi)
+            }
+            assertTrue(adapter.entered.await(10, TimeUnit.SECONDS))
+            val deleteJob = launch(Dispatchers.Default) {
+                index.delete("id", TantivyValue.Text("swift-1"))
+            }
+            // Lookup + delete are one locked unit: they cannot interleave into
+            // the in-flight index() while the encode gate is closed.
+            delay(50)
+            assertFalse(deleteJob.isCompleted)
+            adapter.release.countDown()
+            indexJob.join()
+            deleteJob.join()
+
+            assertNull(index.get("id", TantivyValue.Text("swift-1")))
+            assertNotNull(index.get("id", TantivyValue.Text("slow-2")))
+        }
+
+        HybridIndex.load(path, schema, TestDocAdapter).use { reopened ->
+            assertEquals(1L, reopened.count())
+            assertNull(reopened.get("id", TantivyValue.Text("swift-1")))
+            assertNotNull(reopened.get("id", TantivyValue.Text("slow-2")))
         }
     }
 
@@ -356,22 +403,42 @@ class HybridIndexTest {
     }
 
     @Test
-    fun adapterWritingDocIdFieldIsRejectedAndRolledBack() = runTest {
+    fun adapterWritingDocIdFieldIsRejectedBeforeAnyStateChanges() = runTest {
+        val path = tempPath()
+        val evil = TestDoc("evil-1", "Evil", "writes the reserved field", true)
         val evilAdapter = object : TantivyDocumentAdapter<TestDoc> {
             override fun encode(value: TestDoc, doc: TantivyDocumentWriter) {
                 TestDocAdapter.encode(value, doc)
-                doc.u64("__doc_id", 999)
+                if (value.id == "evil-1") doc.u64("__doc_id", 999)
             }
 
             override fun decode(fields: TantivyFieldMap): TestDoc = TestDocAdapter.decode(fields)
         }
-        HybridIndex.create(tempPath(), schema, evilAdapter, config).use { index ->
+        HybridIndex.create(path, schema, evilAdapter, config).use { index ->
+            repeat(3) {
+                try {
+                    index.add(evil, docs[0].embedding)
+                    fail("expected ReservedField")
+                } catch (_: HybridSearchException.ReservedField) {
+                }
+            }
             try {
-                index.add(docs[0].document, docs[0].embedding)
+                index.addAll(
+                    listOf(
+                        HybridDocument(docs[0].document, docs[0].embedding),
+                        HybridDocument(evil, docs[1].embedding),
+                    ),
+                )
                 fail("expected ReservedField")
             } catch (_: HybridSearchException.ReservedField) {
             }
             assertEquals(0L, index.count())
+            index.commit()
+            // Rejection happened before any FFI mutation: repeated programmer
+            // errors left no (tombstoned) points — an empty commit writes no
+            // dump files — and never advanced the id counter.
+            assertFalse(File(path, "hnsw.hnsw.graph").exists())
+            assertEquals(0L, index.index(docs[0].document, docs[0].embedding))
         }
     }
 
@@ -446,6 +513,188 @@ class HybridIndexTest {
             assertTrue("lexical-only hit missing from fusion: $fused", "lex-1" in fused)
             assertTrue("vector-only hit missing from fusion: $fused", "vec-1" in fused)
         }
+    }
+
+    // -- HY2/HY3: the committed marker is authoritative ---------------------------------
+
+    @Test
+    fun missingGraphFileOnAPopulatedIndexIsCorruptionNotEmpty() = runTest {
+        val path = tempPath()
+        makeSeededIndex(path).first.close()
+        assertTrue(File(path, "hnsw.hnsw.graph").delete())
+
+        try {
+            HybridIndex.load(path, schema, TestDocAdapter)
+            fail("expected VectorStateCorrupt")
+        } catch (_: HybridSearchException.VectorStateCorrupt) {
+        }
+    }
+
+    @Test
+    fun partialVectorFilesOnAPopulatedIndexAreCorruption() = runTest {
+        val path = tempPath()
+        makeSeededIndex(path).first.close()
+        assertTrue(File(path, "hnsw.hnsw.data").delete()) // graph present, data gone
+
+        try {
+            HybridIndex.load(path, schema, TestDocAdapter)
+            fail("expected VectorStateCorrupt")
+        } catch (_: HybridSearchException.VectorStateCorrupt) {
+        }
+    }
+
+    @Test
+    fun strayVectorFilesUnderAnEmptyMarkerAreRemovedOnLoad() = runTest {
+        val path = tempPath()
+        HybridIndex.create(path, schema, TestDocAdapter, config).use { it.commit() }
+        // Leftovers of an interrupted clear()/commit(): the committed marker
+        // says empty, so these must be swept, not loaded.
+        File(path, "hnsw.hnsw.graph").writeBytes(byteArrayOf(1, 2, 3))
+        File(path, "hnsw.deleted").writeBytes(ByteArray(8))
+
+        HybridIndex.load(path, schema, TestDocAdapter).use { reopened ->
+            assertEquals(0L, reopened.count())
+            assertFalse(File(path, "hnsw.hnsw.graph").exists())
+            assertFalse(File(path, "hnsw.deleted").exists())
+            reopened.index(docs[0].document, docs[0].embedding)
+            assertEquals(1L, reopened.count())
+        }
+    }
+
+    @Test
+    fun clearFailsLoudlyWhenVectorFilesCannotBeDeleted() = runTest {
+        val path = tempPath()
+        val (index, _) = makeSeededIndex(path)
+        val dir = File(path)
+        // A read-only directory denies unlink, so File.delete() reports false.
+        check(dir.setWritable(false))
+        try {
+            try {
+                index.clear()
+                fail("expected VectorStateCorrupt")
+            } catch (_: HybridSearchException.VectorStateCorrupt) {
+            }
+        } finally {
+            check(dir.setWritable(true))
+        }
+
+        // Observable and recoverable: once deletion works again, clear() does too.
+        index.clear()
+        assertEquals(0L, index.count())
+        assertFalse(File(path, "hnsw.hnsw.graph").exists())
+        index.close()
+        HybridIndex.load(path, schema, TestDocAdapter).use { assertEquals(0L, it.count()) }
+    }
+
+    // -- HY5: docId counter domain --------------------------------------------------
+
+    private fun rewriteNextDocId(path: String, value: Long) {
+        val meta = File(path, "hybrid.meta.json")
+        val rewritten = meta.readText().replace("\"nextDocId\":0", "\"nextDocId\":$value")
+        check(rewritten != meta.readText() || value == 0L) { "nextDocId not found in metadata" }
+        meta.writeText(rewritten)
+    }
+
+    @Test
+    fun negativeNextDocIdInMetadataFailsLoad() = runTest {
+        val path = tempPath()
+        HybridIndex.create(path, schema, TestDocAdapter, config).use { it.commit() }
+        rewriteNextDocId(path, -5)
+
+        try {
+            HybridIndex.load(path, schema, TestDocAdapter)
+            fail("expected MetadataCorrupt")
+        } catch (e: HybridSearchException.MetadataCorrupt) {
+            assertTrue(e.message.orEmpty().contains("nextDocId"))
+        }
+    }
+
+    @Test
+    fun docIdSpaceExhaustionFailsBeforeAnyMutation() = runTest {
+        val path = tempPath()
+        HybridIndex.create(path, schema, TestDocAdapter, config).use { it.commit() }
+        rewriteNextDocId(path, Long.MAX_VALUE)
+
+        HybridIndex.load(path, schema, TestDocAdapter).use { index ->
+            suspend fun expectExhausted(block: suspend () -> Unit) {
+                try {
+                    block()
+                    fail("expected IllegalStateException")
+                } catch (e: IllegalStateException) {
+                    assertTrue(e.message.orEmpty().contains("exhausted"))
+                }
+            }
+            expectExhausted { index.add(docs[0].document, docs[0].embedding) }
+            expectExhausted { index.addAll(docs) }
+            assertEquals(0L, index.count())
+            index.commit()
+        }
+        // The failed adds mutated nothing: no documents, no vector files.
+        HybridIndex.load(path, schema, TestDocAdapter).use { reopened ->
+            assertEquals(0L, reopened.count())
+            assertFalse(File(path, "hnsw.hnsw.graph").exists())
+        }
+    }
+
+    @Test
+    fun lastMintableDocIdIsUsableAndTheCounterNeverWraps() = runTest {
+        val path = tempPath()
+        HybridIndex.create(path, schema, TestDocAdapter, config).use { it.commit() }
+        rewriteNextDocId(path, Long.MAX_VALUE - 1)
+
+        HybridIndex.load(path, schema, TestDocAdapter).use { index ->
+            // A batch that would need MAX itself is rejected before mutating...
+            try {
+                index.addAll(listOf(docs[0], docs[1]))
+                fail("expected IllegalStateException")
+            } catch (_: IllegalStateException) {
+            }
+            assertEquals(0L, index.count())
+            // ...while the last representable single mint works and the
+            // counter lands exactly on MAX without wrapping.
+            assertEquals(Long.MAX_VALUE - 1, index.index(docs[0].document, docs[0].embedding))
+            try {
+                index.add(docs[1].document, docs[1].embedding)
+                fail("expected IllegalStateException")
+            } catch (_: IllegalStateException) {
+            }
+            assertEquals(1L, index.count())
+        }
+        HybridIndex.load(path, schema, TestDocAdapter).use { reopened ->
+            assertEquals(1L, reopened.count())
+            assertNotNull(reopened.get(Long.MAX_VALUE - 1))
+        }
+    }
+
+    // -- HY4: delete-by-field addresses records without decoding them ----------------
+
+    @Test
+    fun deleteByFieldDoesNotRequireUserDocumentDecoding() = runTest {
+        val path = tempPath()
+        HybridIndex.create(path, schema, TestDocAdapter, config).use { index ->
+            index.index(docs[0].document, docs[0].embedding)
+        }
+
+        val brokenDecoder = object : TantivyDocumentAdapter<TestDoc> {
+            override fun encode(value: TestDoc, doc: TantivyDocumentWriter) = TestDocAdapter.encode(value, doc)
+
+            override fun decode(fields: TantivyFieldMap): TestDoc =
+                error("legacy record this decoder cannot read")
+        }
+        HybridIndex.load(path, schema, brokenDecoder).use { index ->
+            // The decoder really is broken for full document reads...
+            try {
+                index.get("id", TantivyValue.Text("swift-1"))
+                fail("expected the decoder failure")
+            } catch (e: IllegalStateException) {
+                assertTrue(e.message.orEmpty().contains("legacy record"))
+            }
+            // ...but delete-by-field resolves only the internal stored id.
+            index.delete("id", TantivyValue.Text("swift-1"))
+            assertEquals(0L, index.count())
+        }
+
+        HybridIndex.load(path, schema, TestDocAdapter).use { assertEquals(0L, it.count()) }
     }
 
     // -- lifecycle ---------------------------------------------------------------------

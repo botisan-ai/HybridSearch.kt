@@ -25,12 +25,13 @@ import kotlinx.coroutines.withContext
  * and delete-by-field (lookup + delete) — runs under one outer mutex on
  * [Dispatchers.IO], so no other caller can interleave between their steps.
  *
- * Durable empty state: **missing HNSW files mean an empty vector graph.**
- * [commit] skips the vector dump while the graph is physically empty (hnsw_rs
- * cannot dump zero points) and deletes stale graph files; [clear] deletes
- * them; loading a directory without them starts a fresh in-memory graph. A
- * freshly created (or crashed-before-first-commit) index therefore reopens
- * fine.
+ * Durable empty state: hnsw_rs cannot dump a physically empty graph, so an
+ * empty index has **no HNSW files** — and the committed metadata records which
+ * state is expected (`hasVectorGraph`). [load] treats missing or partial graph
+ * files under a populated marker as [HybridSearchException.VectorStateCorrupt]
+ * instead of silently downgrading to text-only search, and removes stray
+ * files when the committed state is empty. Stale files that cannot be deleted
+ * fail loudly ([clear]/[commit] throw) rather than resurrecting on reopen.
  *
  * Deliberate deviation from the Swift port source: RRF ties are broken
  * deterministically (score desc, then docId asc) — the Swift implementation's
@@ -41,8 +42,11 @@ public class HybridIndex<T> private constructor(
     private val tantivyIndex: TypedTantivyIndex<DocRecord<T>>,
     private var hnswIndex: HnswIndex,
     public val schema: TantivySchema,
+    private val effectiveSchema: TantivySchema,
+    private val recordAdapter: DocIdAdapter<T>,
     private val config: HybridIndexConfig,
     private var nextDocId: Long,
+    private var hasVectorGraph: Boolean,
     public val primaryIdField: String,
     private val schemaFingerprint: String,
 ) : AutoCloseable {
@@ -56,7 +60,15 @@ public class HybridIndex<T> private constructor(
     private val defaultTextFields = schema.defaultTextFieldNames
 
     /** The user's document plus the minted internal doc id, as stored in Tantivy. */
-    internal class DocRecord<T>(val doc: T, val docId: Long)
+    internal class DocRecord<T>(val docId: Long, docProvider: () -> T) {
+        /**
+         * Decoding is deferred so id-only paths (delete-by-field) can address
+         * a record even when the user decoder would fail on it.
+         */
+        val doc: T by lazy(docProvider)
+
+        constructor(doc: T, docId: Long) : this(docId, { doc })
+    }
 
     /**
      * Wraps the user adapter: appends `__doc_id` on encode (after checking the
@@ -77,7 +89,7 @@ public class HybridIndex<T> private constructor(
 
         override fun decode(fields: TantivyFieldMap): DocRecord<T> {
             val docId = fields.u64(DOC_ID_FIELD) ?: throw HybridSearchException.MissingDocId()
-            return DocRecord(user.decode(fields), docId)
+            return DocRecord(docId) { user.decode(fields) }
         }
     }
 
@@ -99,13 +111,18 @@ public class HybridIndex<T> private constructor(
             val primary = resolvePrimaryIdField(schema, primaryIdField)
             directory.mkdirs()
 
+            val effectiveSchema = schema.extending { u64Field(DOC_ID_FIELD) }
+            val recordAdapter = DocIdAdapter(adapter, primary)
             val index = HybridIndex(
                 baseDir = directory,
-                tantivyIndex = openTantivy(directory, schema, adapter, primary),
-                hnswIndex = HnswIndex(config.hnswConfig()),
+                tantivyIndex = openTantivy(directory, effectiveSchema, recordAdapter),
+                hnswIndex = HnswIndex.create(config.hnswConfig()),
                 schema = schema,
+                effectiveSchema = effectiveSchema,
+                recordAdapter = recordAdapter,
                 config = config,
                 nextDocId = 0,
+                hasVectorGraph = false,
                 primaryIdField = primary,
                 schemaFingerprint = schema.fingerprint(),
             )
@@ -136,6 +153,9 @@ public class HybridIndex<T> private constructor(
             if (metadata.version != HybridIndexMetadata.CURRENT_VERSION) {
                 throw HybridSearchException.MetadataCorrupt("version ${metadata.version}")
             }
+            if (metadata.nextDocId < 0) {
+                throw HybridSearchException.MetadataCorrupt("negative nextDocId ${metadata.nextDocId}")
+            }
 
             val primary = primaryIdField?.also {
                 if (it !in schema.idFieldNames) throw HybridSearchException.InvalidPrimaryIdField(it)
@@ -161,9 +181,19 @@ public class HybridIndex<T> private constructor(
                 throw HybridSearchException.MetadataCorrupt(e.message ?: "invalid hnsw config")
             }
 
-            // Missing graph files == empty vector graph (fresh create, clear(),
-            // or a crash before the first non-empty commit).
-            val hnsw = if (File(directory, "$HNSW_BASENAME.hnsw.graph").exists()) {
+            // The committed metadata says whether HNSW files must exist. A
+            // populated marker with missing/partial files is corruption, never
+            // silently an empty vector leg; an empty marker with stray files
+            // (interrupted clear()/commit()) removes them before trusting the
+            // empty state.
+            val hnsw = if (metadata.hasVectorGraph) {
+                val missing = listOf("$HNSW_BASENAME.hnsw.graph", "$HNSW_BASENAME.hnsw.data")
+                    .filterNot { File(directory, it).exists() }
+                if (missing.isNotEmpty()) {
+                    throw HybridSearchException.VectorStateCorrupt(
+                        "metadata records a persisted vector graph but ${missing.joinToString()} missing",
+                    )
+                }
                 HnswIndex.load(
                     directory = directory,
                     basename = HNSW_BASENAME,
@@ -172,17 +202,22 @@ public class HybridIndex<T> private constructor(
                     config = config.hnswConfig(),
                 )
             } else {
-                File(directory, "$HNSW_BASENAME.deleted").delete() // stray sidecar without a graph
-                HnswIndex(config.hnswConfig())
+                deleteHnswFiles(directory)
+                HnswIndex.create(config.hnswConfig())
             }
 
+            val effectiveSchema = schema.extending { u64Field(DOC_ID_FIELD) }
+            val recordAdapter = DocIdAdapter(adapter, primary)
             HybridIndex(
                 baseDir = directory,
-                tantivyIndex = openTantivy(directory, schema, adapter, primary),
+                tantivyIndex = openTantivy(directory, effectiveSchema, recordAdapter),
                 hnswIndex = hnsw,
                 schema = schema,
+                effectiveSchema = effectiveSchema,
+                recordAdapter = recordAdapter,
                 config = config,
                 nextDocId = metadata.nextDocId,
+                hasVectorGraph = metadata.hasVectorGraph,
                 primaryIdField = primary,
                 schemaFingerprint = fingerprint,
             )
@@ -234,14 +269,25 @@ public class HybridIndex<T> private constructor(
 
         private suspend fun <T> openTantivy(
             baseDir: File,
-            schema: TantivySchema,
-            adapter: TantivyDocumentAdapter<T>,
-            primaryIdField: String,
+            effectiveSchema: TantivySchema,
+            recordAdapter: DocIdAdapter<T>,
         ): TypedTantivyIndex<DocRecord<T>> {
-            val effectiveSchema = schema.extending { u64Field(DOC_ID_FIELD) }
             val tantivyDir = File(baseDir, "tantivy")
             tantivyDir.mkdirs()
-            return TypedTantivyIndex.open(tantivyDir, effectiveSchema, DocIdAdapter(adapter, primaryIdField))
+            return TypedTantivyIndex.open(tantivyDir, effectiveSchema, recordAdapter)
+        }
+
+        /** Removes the HNSW dump/sidecar files, throwing when one survives deletion. */
+        private fun deleteHnswFiles(directory: File) {
+            val names = listOf("$HNSW_BASENAME.hnsw.graph", "$HNSW_BASENAME.hnsw.data", "$HNSW_BASENAME.deleted")
+            for (name in names) {
+                val file = File(directory, name)
+                if (file.exists() && !file.delete()) {
+                    throw HybridSearchException.VectorStateCorrupt(
+                        "could not delete stale vector file ${file.absolutePath}",
+                    )
+                }
+            }
         }
     }
 
@@ -391,15 +437,20 @@ public class HybridIndex<T> private constructor(
     public suspend fun compact(): Unit = locked {
         hnswIndex.compact(config.hnswConfig())
         persistHnswLocked()
+        persistMetadata() // compacting away the last points flips hasVectorGraph
     }
 
     /** Removes every document and vector, durably: reopening after clear yields an empty index. */
     public suspend fun clear(): Unit = locked {
         tantivyIndex.clear()
+        // Files before state: if a stale dump cannot be removed, fail here —
+        // with the marker still true — instead of recording an empty state a
+        // reopen would contradict. The in-memory graph is still intact.
+        deleteHnswFiles(baseDir)
         hnswIndex.close()
-        deleteHnswFiles()
-        hnswIndex = HnswIndex(config.hnswConfig())
+        hnswIndex = HnswIndex.create(config.hnswConfig())
         nextDocId = 0
+        hasVectorGraph = false
         persistMetadata()
     }
 
@@ -420,34 +471,61 @@ public class HybridIndex<T> private constructor(
 
     private suspend fun addLocked(doc: T, embedding: FloatArray): Long {
         validateEmbedding(embedding)
-        val docId = nextDocId
-        nextDocId += 1
+        val docId = mintableDocId(count = 1)
+        // Programmer errors (unknown/reserved fields, wrong value kinds,
+        // primary-id cardinality) must surface before the vector enters the
+        // insert-only graph: a rejected document leaves no tombstoned point
+        // and does not advance the id counter.
+        preflightEncode(doc, docId)
 
         hnswIndex.insert(embedding, docId)
         try {
             tantivyIndex.add(DocRecord(doc, docId))
         } catch (e: Exception) {
+            // Post-validation failure (I/O etc.): the vector is already in the
+            // insert-only graph, so tombstone it and burn its id.
             hnswIndex.delete(docId)
+            nextDocId = docId + 1
             throw e
         }
+        nextDocId = docId + 1
         return docId
     }
 
     private suspend fun addAllLocked(docs: List<HybridDocument<T>>): List<Long> {
         if (docs.isEmpty()) return emptyList()
         docs.forEach { validateEmbedding(it.embedding) }
-
-        val docIds = docs.indices.map { nextDocId + it }
-        nextDocId += docs.size
+        val first = mintableDocId(count = docs.size)
+        val docIds = docs.indices.map { first + it }
+        // Validate the whole batch before any mutation, like the single path.
+        docs.zip(docIds).forEach { (d, docId) -> preflightEncode(d.document, docId) }
 
         hnswIndex.insertBatch(docs.map { it.embedding }, docIds)
         try {
             tantivyIndex.addAll(docs.zip(docIds) { d, docId -> DocRecord(d.document, docId) })
         } catch (e: Exception) {
             docIds.forEach { hnswIndex.delete(it) }
+            nextDocId = docIds.last() + 1
             throw e
         }
+        nextDocId = docIds.last() + 1
         return docIds
+    }
+
+    /**
+     * First id of a [count]-sized mint, verified against the Long domain
+     * before anything mutates — the counter must never wrap.
+     */
+    private fun mintableDocId(count: Int): Long {
+        check(nextDocId <= Long.MAX_VALUE - count) {
+            "__doc_id space exhausted (nextDocId=$nextDocId, adding $count)"
+        }
+        return nextDocId
+    }
+
+    /** Runs the full adapter/schema validation on a throwaway writer — no FFI, no state. */
+    private fun preflightEncode(doc: T, docId: Long) {
+        recordAdapter.encode(DocRecord(doc, docId), TantivyDocumentWriter(effectiveSchema))
     }
 
     private suspend fun commitLocked() {
@@ -467,22 +545,19 @@ public class HybridIndex<T> private constructor(
     }
 
     /**
-     * Persists vector state. A physically empty graph cannot be dumped
-     * (hnsw_rs limitation), so empty == no files on disk; a fully-tombstoned
-     * graph still dumps, carrying its tombstones.
+     * Persists vector state and tracks the marker the metadata will commit. A
+     * physically empty graph cannot be dumped (hnsw_rs limitation), so empty
+     * == no files on disk; a fully-tombstoned graph still dumps, carrying its
+     * tombstones. Undeletable stale files throw instead of surviving silently.
      */
     private suspend fun persistHnswLocked() {
         if (hnswIndex.graphSize() == 0L) {
-            deleteHnswFiles()
+            deleteHnswFiles(baseDir)
+            hasVectorGraph = false
         } else {
             hnswIndex.save(baseDir, HNSW_BASENAME)
+            hasVectorGraph = true
         }
-    }
-
-    private fun deleteHnswFiles() {
-        File(baseDir, "$HNSW_BASENAME.hnsw.graph").delete()
-        File(baseDir, "$HNSW_BASENAME.hnsw.data").delete()
-        File(baseDir, "$HNSW_BASENAME.deleted").delete()
     }
 
     private fun validateEmbedding(embedding: FloatArray) {
@@ -519,6 +594,7 @@ public class HybridIndex<T> private constructor(
                 nextDocId = nextDocId,
                 primaryIdField = primaryIdField,
                 schemaFingerprint = schemaFingerprint,
+                hasVectorGraph = hasVectorGraph,
             ),
             metadataFile,
         )

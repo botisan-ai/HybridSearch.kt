@@ -31,6 +31,14 @@ public sealed class HybridSearchException(message: String) : Exception(message) 
     public class InvalidPrimaryIdValue(public val field: String, public val count: Int) :
         HybridSearchException("Document must carry exactly one '$field' value (got $count)")
 
+    /**
+     * The on-disk vector state contradicts the committed metadata (graph files
+     * missing/partial for a populated index, or stale files that cannot be
+     * removed). Nothing is silently downgraded to text-only search.
+     */
+    public class VectorStateCorrupt(detail: String) :
+        HybridSearchException("Hybrid vector state corrupt: $detail")
+
     public class AlreadyClosed : HybridSearchException("Index is closed")
 }
 
@@ -47,8 +55,10 @@ public data class HybridIndexConfig(
         // Same bounds HnswConfig enforces — checked here so an invalid config
         // fails at construction, not at first use.
         require(embeddingDimension >= 1) { "embeddingDimension must be >= 1 (got $embeddingDimension)" }
-        require(hnswMaxConnections in 1..256) { "hnswMaxConnections must be in 1..256 (got $hnswMaxConnections)" }
-        require(hnswMaxElements >= 1) { "hnswMaxElements must be >= 1 (got $hnswMaxElements)" }
+        require(hnswMaxConnections in 2..255) { "hnswMaxConnections must be in 2..255 (got $hnswMaxConnections)" }
+        require(hnswMaxElements in 1..HnswConfig.MAX_ELEMENTS_LIMIT) {
+            "hnswMaxElements must be in 1..${HnswConfig.MAX_ELEMENTS_LIMIT} (got $hnswMaxElements)"
+        }
         require(hnswMaxLayers in 1..16) { "hnswMaxLayers must be in 1..16 (got $hnswMaxLayers)" }
         require(hnswEfConstruction >= 1) { "hnswEfConstruction must be >= 1 (got $hnswEfConstruction)" }
     }
