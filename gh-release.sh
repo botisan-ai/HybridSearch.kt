@@ -10,6 +10,12 @@ cd "$(dirname "$0")"
 ARTIFACT="hybridsearch-android"
 VERSION=$(grep '^version=' android/gradle.properties | cut -d= -f2)
 
+# Fetch the *released* dependency zips first (checksummed downloads): the
+# gates below then build against the same repos consumers will resolve, and a
+# missing upstream release fails here instead of after upload.
+echo "==> release channel deps (bootstrap-deps.sh)"
+./bootstrap-deps.sh
+
 echo "==> release gates (test + lintRelease + assembleRelease)"
 (cd android && ./gradlew --console=plain test lintRelease assembleRelease)
 
@@ -18,7 +24,8 @@ rm -rf android/build/maven-repo
 (cd android && ./gradlew --console=plain publishReleasePublicationToBuildDirRepository)
 
 STAGING=$(mktemp -d)
-trap 'rm -rf "$STAGING"' EXIT
+UNZIPPED=$(mktemp -d)
+trap 'rm -rf "$STAGING" "$UNZIPPED"' EXIT
 
 (cd android/build/maven-repo && zip -qr "$STAGING/$ARTIFACT-$VERSION-maven.zip" .)
 cp "android/lib/build/outputs/aar/lib-release.aar" "$STAGING/$ARTIFACT-$VERSION.aar"
@@ -32,6 +39,15 @@ if unzip -l "$STAGING/$ARTIFACT-$VERSION-maven.zip" | grep -q " maven-repo/"; th
   echo "FAIL: maven zip contains a maven-repo/ wrapper directory" >&2
   exit 1
 fi
+
+# Grep proves the member list; only real Gradle resolution proves the POM,
+# module metadata, transitive deps, and repository layout. Resolve the exact
+# zip being shipped — against the *downloaded release* repos of tantivy/hnsw,
+# never the sibling dev checkouts — from a cache-isolated consumer.
+unzip -qo "$STAGING/$ARTIFACT-$VERSION-maven.zip" -d "$UNZIPPED"
+TANTIVY_REPO=$(ls -d android/build/native-repos/tantivy-android-*/ | head -1)
+HNSW_REPO=$(ls -d android/build/native-repos/hnsw-android-*/ | head -1)
+./verify-consumer-resolution.sh "ai.botisan:$ARTIFACT:$VERSION" "$UNZIPPED" "$TANTIVY_REPO" "$HNSW_REPO"
 
 (cd "$STAGING" \
   && shasum -a 256 "$ARTIFACT-$VERSION-maven.zip" > "$ARTIFACT-$VERSION-maven.zip.sha256" \
