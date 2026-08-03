@@ -49,4 +49,26 @@ class HybridSmokeTest {
         dir.deleteRecursively()
         Unit
     }
+
+    /** The full persistence cycle must run on the device's API level (metadata + vector files, API 24-safe writes). */
+    @Test
+    fun createCommitCloseReopenOnDevice() = runBlocking {
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val dir = File(ctx.filesDir, "hybrid_reopen_${System.currentTimeMillis()}")
+        val schema = tantivySchema {
+            idField("id")
+            textField("text")
+        }
+        val config = HybridIndexConfig(embeddingDimension = 4)
+        HybridIndex.create(dir.absolutePath, schema, NoteAdapter, config).use { index ->
+            index.index(Note("n1", "coffee at blue bottle"), floatArrayOf(1f, 0f, 0f, 0f))
+        }
+        HybridIndex.open(dir.absolutePath, schema, NoteAdapter, config).use { reopened ->
+            assertEquals(1L, reopened.count())
+            val hits = reopened.searchHybrid(HybridTextQuery("coffee"), floatArrayOf(1f, 0f, 0f, 0f), limit = 1)
+            assertEquals("n1", hits.first().document.id)
+        }
+        dir.deleteRecursively()
+        Unit
+    }
 }
