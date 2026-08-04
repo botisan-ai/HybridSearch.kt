@@ -76,16 +76,18 @@ HNSW_REPO="android/build/native-repos/hnsw-android-$HNSW_VERSION"
 
 CHECKSUMS=$(cat "$STAGING/$ARTIFACT-$VERSION-maven.zip.sha256" "$STAGING/$ARTIFACT-$VERSION.aar.sha256")
 
-echo "==> creating GitHub release $VERSION"
-gh release create "$VERSION" --generate-notes --notes "SHA-256:
+echo "==> creating draft GitHub release $VERSION"
+gh release create "$VERSION" --draft --target "$(git rev-parse HEAD)" --generate-notes --notes "SHA-256:
 \`\`\`
 $CHECKSUMS
-\`\`\`" || true
+\`\`\`"
 gh release upload "$VERSION" \
   "$STAGING/$ARTIFACT-$VERSION-maven.zip" \
   "$STAGING/$ARTIFACT-$VERSION-maven.zip.sha256" \
   "$STAGING/$ARTIFACT-$VERSION.aar" \
-  "$STAGING/$ARTIFACT-$VERSION.aar.sha256" \
-  --clobber
+  "$STAGING/$ARTIFACT-$VERSION.aar.sha256"
+
+echo "==> publishing immutable GitHub release $VERSION"
+gh release edit "$VERSION" --draft=false
 
 echo "==> done"
