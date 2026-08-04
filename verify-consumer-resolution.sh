@@ -73,5 +73,5 @@ EOF
 echo "sdk.dir=$ANDROID_HOME" > "$CONSUMER/local.properties"
 
 echo "==> resolving $COORDINATE in a cache-isolated consumer (fresh GRADLE_USER_HOME)"
-(cd android && ./gradlew --console=plain -g "$GRADLE_HOME" -p "$CONSUMER" :consumer:verifyResolves)
+(cd android && ./gradlew --no-daemon --console=plain -g "$GRADLE_HOME" -p "$CONSUMER" :consumer:verifyResolves)
 echo "==> consumer resolution OK: $COORDINATE"
