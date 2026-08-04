@@ -1,10 +1,12 @@
 package ai.botisan.hybridsearch
 
+import ai.botisan.hnsw.HnswIndexException
 import ai.botisan.tantivy.TantivyDocumentAdapter
 import ai.botisan.tantivy.TantivyDocumentWriter
 import ai.botisan.tantivy.TantivyFieldMap
 import ai.botisan.tantivy.TantivyQuery
 import ai.botisan.tantivy.TantivyValue
+import ai.botisan.tantivy.ffi.TantivyIndexException
 import ai.botisan.tantivy.tantivySchema
 import java.io.File
 import java.nio.file.Files
@@ -74,6 +76,9 @@ class HybridIndexTest {
     /** Every HNSW dump/sidecar file in the directory, any generation. */
     private fun hnswFiles(path: String): List<String> =
         File(path).listFiles().orEmpty().filter { it.isFile && it.name.startsWith("hnsw") }.map { it.name }.sorted()
+
+    /** Matches the generation-numbered dump names the package owns. */
+    private val GENERATION_FILE_FOR_TEST = Regex("""^hnsw-g\d+\.""")
 
     private suspend fun makeSeededIndex(path: String = tempPath()): Pair<HybridIndex<TestDoc>, List<Long>> {
         val index = HybridIndex.create(path, schema, TestDocAdapter, config)
@@ -589,6 +594,57 @@ class HybridIndexTest {
         HybridIndex.load(path, schema, TestDocAdapter).use { assertEquals(0L, it.count()) }
     }
 
+    @Test
+    fun sweepTouchesOnlyRecognizedVectorFiles() = runTest {
+        val path = tempPath()
+        val (index, _) = makeSeededIndex(path) // publishes generation 1
+        // Same-prefix files the package does not own — including an hnsw-g
+        // name outside the numbered-triplet grammar — must never be deleted
+        // by commit, load, or clear...
+        File(path, "hnsw-notes.txt").writeText("the caller's file")
+        File(path, "hnswx.bin").writeBytes(byteArrayOf(1))
+        File(path, "hnsw-g9x.deleted").writeBytes(ByteArray(8))
+        // ...while a recognized stray generation triplet is swept as before.
+        File(path, "hnsw-g99.hnsw.graph").writeBytes(byteArrayOf(1, 2, 3))
+
+        index.index(docs[0].document, docs[0].embedding) // commit → sweep
+        index.close()
+
+        val afterCommit = File(path).listFiles()!!.map { it.name }
+        assertTrue("hnsw-notes.txt" in afterCommit)
+        assertTrue("hnswx.bin" in afterCommit)
+        assertTrue("hnsw-g9x.deleted" in afterCommit)
+        assertFalse("hnsw-g99.hnsw.graph" in afterCommit)
+
+        // load() and clear() honor the same ownership boundary.
+        HybridIndex.load(path, schema, TestDocAdapter).use { it.clear() }
+        val afterClear = File(path).listFiles()!!.map { it.name }
+        assertTrue("hnsw-notes.txt" in afterClear)
+        assertTrue("hnswx.bin" in afterClear)
+        assertTrue("hnsw-g9x.deleted" in afterClear)
+        assertFalse(afterClear.any { GENERATION_FILE_FOR_TEST.matches(it) })
+    }
+
+    @Test
+    fun sweepFailsLoudlyWhenTheDirectoryCannotBeEnumerated() = runTest {
+        val path = tempPath()
+        val (index, _) = makeSeededIndex(path)
+        val dir = File(path)
+        // Removing read permission makes File.listFiles() return null while
+        // traversal (+x) still lets Tantivy reach its subdirectory — exactly
+        // the "enumeration failed" shape that must not read as a clean sweep.
+        check(dir.setReadable(false)) { "test needs permission control over the index directory" }
+        try {
+            index.clear()
+            fail("expected VectorStateCorrupt")
+        } catch (e: HybridSearchException.VectorStateCorrupt) {
+            assertTrue(e.message.orEmpty().contains(path))
+        } finally {
+            check(dir.setReadable(true))
+            index.close()
+        }
+    }
+
     // -- HY2/HY3: crash-safe commit protocol -----------------------------------------
 
     @Test
@@ -704,6 +760,129 @@ class HybridIndexTest {
         }
     }
 
+    // -- HY7: adds stage atomically and roll back without committing ------------------
+
+    @Test
+    fun addAllStagesNothingWhenALaterDocumentFailsNativeValidation() = runTest {
+        // Facet paths pass the Kotlin writer's kind check and only fail in
+        // native Facet::from_text — the class of failure that used to leave
+        // the batch's earlier documents pending in the writer as orphans
+        // sharing a reusable __doc_id.
+        data class FDoc(val id: String, val tag: String)
+
+        val facetSchema = tantivySchema {
+            idField("id")
+            facetField("tag")
+        }
+        val adapter = object : TantivyDocumentAdapter<FDoc> {
+            override fun encode(value: FDoc, doc: TantivyDocumentWriter) {
+                doc.text("id", value.id)
+                doc.facet("tag", value.tag)
+            }
+
+            override fun decode(fields: TantivyFieldMap): FDoc =
+                FDoc(fields.text("id")!!, fields.facet("tag")!!)
+        }
+        val path = tempPath()
+        HybridIndex.create(path, facetSchema, adapter, config).use { index ->
+            try {
+                index.addAll(
+                    listOf(
+                        HybridDocument(FDoc("a", "/ok"), TestEmbeddings.docSwiftConcurrency),
+                        HybridDocument(FDoc("b", "not-a-facet"), TestEmbeddings.docRustFfi),
+                    ),
+                )
+                fail("expected the native facet validation to reject the batch")
+            } catch (_: TantivyIndexException) {
+            }
+            // Nothing staged anywhere: no pending text survives the commit,
+            // no vectors were inserted, and the minted ids stayed reusable.
+            index.commit()
+            assertEquals(0L, index.count())
+            assertEquals(emptyList<String>(), hnswFiles(path))
+
+            val ids = index.addAll(
+                listOf(
+                    HybridDocument(FDoc("a", "/ok"), TestEmbeddings.docSwiftConcurrency),
+                    HybridDocument(FDoc("b", "/also-ok"), TestEmbeddings.docRustFfi),
+                ),
+            )
+            index.commit()
+            assertEquals(listOf(0L, 1L), ids)
+            assertEquals(2L, index.count())
+            assertEquals("a", index.get(0L)?.id)
+            assertEquals("b", index.get(1L)?.id)
+        }
+    }
+
+    @Test
+    fun failedVectorInsertRollsBackWithoutCommittingEarlierStagedWork() = runTest {
+        val path = tempPath()
+        val meta = File(path, "hybrid.meta.json")
+        HybridIndex.create(path, schema, TestDocAdapter, config).use { index ->
+            val idA = index.add(docs[0].document, docs[0].embedding) // staged, uncommitted
+            val publishedMetadata = meta.readBytes()
+
+            index.vectorInsertFailureForTest = { throw RuntimeException("injected vector-leg failure") }
+            try {
+                index.add(docs[1].document, docs[1].embedding)
+                fail("expected the injected vector-leg failure")
+            } catch (e: RuntimeException) {
+                assertEquals("injected vector-leg failure", e.message)
+            } finally {
+                index.vectorInsertFailureForTest = null
+            }
+
+            // The failed add published nothing. The old committing-delete
+            // rollback made all three of these observable: A became durable,
+            // the metadata advanced, and a vector generation appeared.
+            assertEquals(0L, index.count())
+            assertTrue(meta.readBytes().contentEquals(publishedMetadata))
+            assertEquals(emptyList<String>(), hnswFiles(path))
+
+            // B's id is burned and its text masked: the explicit commit
+            // publishes exactly A, and the next mint continues past B.
+            index.commit()
+            assertEquals(1L, index.count())
+            assertEquals(docs[0].document.id, index.get(idA)?.id)
+            assertNull(index.get(idA + 1))
+            assertEquals(idA + 2, index.add(docs[2].document, docs[2].embedding))
+        }
+    }
+
+    @Test
+    fun remintingATombstonedIdFailsTypedAndPublishesNothing() = runTest {
+        val path = tempPath()
+        val meta = File(path, "hybrid.meta.json")
+        // Durable state: id 0 tombstoned, no committed documents.
+        HybridIndex.create(path, schema, TestDocAdapter, config).use { index ->
+            index.index(docs[0].document, docs[0].embedding) // docId 0
+            index.delete(0L)
+        }
+        // Metadata damage no load-time check can catch: rewind nextDocId to 0.
+        // docCount matches (0 == 0) and the probe finds no committed __doc_id —
+        // the collision only surfaces at the vector leg of the next add,
+        // after its text write. This is the natural (seam-free) rollback path.
+        val rewound = meta.readText().replace("\"nextDocId\":1", "\"nextDocId\":0")
+        check(rewound != meta.readText()) { "nextDocId not found in metadata" }
+        meta.writeText(rewound)
+
+        HybridIndex.load(path, schema, TestDocAdapter).use { index ->
+            val before = meta.readBytes()
+            try {
+                index.add(docs[1].document, docs[1].embedding) // mints tombstoned id 0
+                fail("expected TombstonedId")
+            } catch (_: HnswIndexException.TombstonedId) {
+            }
+            // Typed failure, nothing published — and burning the colliding id
+            // unblocks the counter instead of failing every later add.
+            assertEquals(0L, index.count())
+            assertTrue(meta.readBytes().contentEquals(before))
+            assertEquals(1L, index.index(docs[1].document, docs[1].embedding))
+            assertEquals(1L, index.count())
+        }
+    }
+
     // -- HY5: docId counter domain --------------------------------------------------
 
     private fun rewriteNextDocId(path: String, value: Long) {
@@ -781,6 +960,49 @@ class HybridIndexTest {
         HybridIndex.load(path, schema, TestDocAdapter).use { reopened ->
             assertEquals(1L, reopened.count())
             assertNotNull(reopened.get(Long.MAX_VALUE - 1))
+        }
+    }
+
+    @Test
+    fun generationExhaustionFailsBeforeAnyMutation() = runTest {
+        val path = tempPath()
+        val meta = File(path, "hybrid.meta.json")
+        HybridIndex.create(path, schema, TestDocAdapter, config).use { index ->
+            index.index(docs[0].document, docs[0].embedding) // generation 1
+        }
+        // A maximal-but-valid generation loads fine; only advancing past it
+        // must fail — before the dump, the Tantivy commit, or the publish,
+        // never after (a wrapped negative generation would publish metadata
+        // every later load rejects).
+        val max = Long.MAX_VALUE
+        val doctored = meta.readText().replace("\"generation\":1", "\"generation\":$max")
+        check(doctored != meta.readText()) { "generation not found in metadata" }
+        meta.writeText(doctored)
+        for (suffix in listOf("hnsw.graph", "hnsw.data", "deleted")) {
+            check(File(path, "hnsw-g1.$suffix").renameTo(File(path, "hnsw-g$max.$suffix")))
+        }
+
+        HybridIndex.load(path, schema, TestDocAdapter).use { index ->
+            val before = meta.readBytes()
+            val filesBefore = hnswFiles(path)
+            suspend fun expectExhausted(block: suspend () -> Unit) {
+                try {
+                    block()
+                    fail("expected IllegalStateException")
+                } catch (e: IllegalStateException) {
+                    assertTrue(e.message.orEmpty().contains("generation"))
+                }
+            }
+            // The commit path fails before dumping or committing anything...
+            expectExhausted { index.index(docs[1].document, docs[1].embedding) }
+            // ...and clear() fails before Tantivy is durably cleared.
+            expectExhausted { index.clear() }
+            assertEquals(1L, index.count())
+            assertTrue(meta.readBytes().contentEquals(before))
+            assertEquals(filesBefore, hnswFiles(path))
+        }
+        HybridIndex.load(path, schema, TestDocAdapter).use { reopened ->
+            assertEquals(1L, reopened.count())
         }
     }
 

@@ -326,16 +326,32 @@ public class HybridIndex<T> private constructor(
             return TypedTantivyIndex.open(tantivyDir, effectiveSchema, recordAdapter)
         }
 
+        /** The exact pre-generational dump names this package once wrote. */
+        private val LEGACY_HNSW_FILES = setOf("hnsw.hnsw.graph", "hnsw.hnsw.data", "hnsw.deleted")
+
+        /** A generation-numbered dump/sidecar file, as written by [hnswBasename]. */
+        private val GENERATION_HNSW_FILE = Regex("""^hnsw-g\d+\.(hnsw\.graph|hnsw\.data|deleted)$""")
+
         /**
-         * Removes every HNSW dump/sidecar file except the [keep] generation's
-         * (all of them when [keep] is null), throwing when one survives
-         * deletion — stale dumps must not resurrect on a later load.
+         * Removes every HNSW dump/sidecar file this package recognizes as its
+         * own — the exact legacy names and `hnsw-g<n>` generation triplets,
+         * never arbitrary same-prefix files the caller keeps in the directory —
+         * except the [keep] generation's (all of them when [keep] is null).
+         * Throws when the directory cannot be enumerated or a stale file
+         * survives deletion: stale dumps must not resurrect on a later load,
+         * and a skipped sweep must not read as a clean one.
          */
         private fun sweepHnswFiles(directory: File, keep: String?) {
-            val files = directory.listFiles() ?: return
+            val files = directory.listFiles()
+                ?: throw HybridSearchException.VectorStateCorrupt(
+                    "could not enumerate ${directory.absolutePath} for stale vector files",
+                )
+            val keepNames = keep?.let { setOf("$it.hnsw.graph", "$it.hnsw.data", "$it.deleted") }.orEmpty()
             for (file in files) {
-                if (!file.isFile || !file.name.startsWith("hnsw")) continue
-                if (keep != null && file.name.startsWith("$keep.")) continue
+                if (!file.isFile) continue
+                val name = file.name
+                if (name !in LEGACY_HNSW_FILES && !GENERATION_HNSW_FILE.matches(name)) continue
+                if (name in keepNames) continue
                 if (!file.delete()) {
                     throw HybridSearchException.VectorStateCorrupt(
                         "could not delete stale vector file ${file.absolutePath}",
@@ -349,7 +365,12 @@ public class HybridIndex<T> private constructor(
 
     public suspend fun count(): Long = locked { tantivyIndex.count() }
 
-    /** Adds without committing; returns the minted docId. Rolls back the HNSW insert if Tantivy fails. */
+    /**
+     * Adds without committing; returns the minted docId. A failed call
+     * publishes nothing: validation and the adapter encode reject before any
+     * write, and a vector-leg failure masks the text write inside the same
+     * open transaction (never an involuntary commit of other pending work).
+     */
     public suspend fun add(doc: T, embedding: FloatArray): Long = locked { addLocked(doc, embedding) }
 
     public suspend fun addAll(docs: List<HybridDocument<T>>): List<Long> = locked { addAllLocked(docs) }
@@ -495,6 +516,7 @@ public class HybridIndex<T> private constructor(
 
     /** Removes every document and vector, durably: reopening after clear yields an empty index. */
     public suspend fun clear(): Unit = locked {
+        val newGeneration = mintableGeneration() // before Tantivy is durably cleared
         tantivyIndex.clear()
         // Files before state: if a stale dump cannot be removed, fail here —
         // before the metadata records an empty state a reopen would
@@ -503,7 +525,7 @@ public class HybridIndex<T> private constructor(
         hnswIndex.close()
         hnswIndex = HnswIndex.create(config.hnswConfig())
         nextDocId = 0
-        generation += 1
+        generation = newGeneration
         hasVectorGraph = false
         persistMetadataLocked()
     }
@@ -534,6 +556,7 @@ public class HybridIndex<T> private constructor(
         // second encode exists for a stateful adapter to fail differently on.
         tantivyIndex.add(DocRecord(doc, docId))
         try {
+            vectorInsertFailureForTest?.invoke(listOf(docId))
             hnswIndex.insert(embedding, docId)
         } catch (e: Exception) {
             rollBackDanglingText(listOf(docId), e)
@@ -553,6 +576,7 @@ public class HybridIndex<T> private constructor(
         // with nothing mutated anywhere.
         tantivyIndex.addAll(docs.zip(docIds) { d, docId -> DocRecord(d.document, docId) })
         try {
+            vectorInsertFailureForTest?.invoke(docIds)
             hnswIndex.insertBatch(docs.map { it.embedding }, docIds)
         } catch (e: Exception) {
             rollBackDanglingText(docIds, e)
@@ -562,20 +586,30 @@ public class HybridIndex<T> private constructor(
         return docIds
     }
 
+    // Test seam: the only vector-leg failures reachable in production are
+    // pathological (id collisions after external metadata damage, native
+    // panics), so the rollback regressions inject one here — between the text
+    // write and the HNSW insert — to stage the reviewer sequence
+    // deterministically.
+    internal var vectorInsertFailureForTest: ((List<Long>) -> Unit)? = null
+
     /**
-     * A vector insert failed after its text write: remove the uncommitted
-     * text documents (deleteDoc commits internally — Rust behavior), tombstone
-     * whatever may have physically landed in the insert-only graph, burn the
-     * ids, and republish a consistent durable state so the involuntary Tantivy
-     * commit cannot read as a torn commit on the next load. Rollback failures
-     * ride along as suppressed exceptions.
+     * A vector insert failed after its text write: stage deletes for the
+     * uncommitted text documents in the same open transaction
+     * ([TypedTantivyIndex.deleteDocWithoutCommit] masks exactly the documents
+     * added before it), so this failed call publishes nothing — in particular
+     * it cannot make another caller's still-uncommitted work durable the way
+     * a committing delete would. The tombstone attempt is a no-op on every
+     * prevalidated failure path (no point landed, so the graph never
+     * registered the id); the ids are burned regardless, because a tombstoned
+     * or unknown-partial id must never be reminted. Rollback failures ride
+     * along as suppressed exceptions.
      */
     private suspend fun rollBackDanglingText(docIds: List<Long>, cause: Exception) {
         try {
-            docIds.forEach { tantivyIndex.deleteDoc(DOC_ID_FIELD, TantivyValue.U64(it)) }
-            docIds.forEach { hnswIndex.delete(it) }
+            docIds.forEach { tantivyIndex.deleteDocWithoutCommit(DOC_ID_FIELD, TantivyValue.U64(it)) }
+            hnswIndex.delete(docIds)
             nextDocId = docIds.last() + 1
-            commitLocked()
         } catch (rollback: Exception) {
             cause.addSuppressed(rollback)
         }
@@ -593,6 +627,19 @@ public class HybridIndex<T> private constructor(
     }
 
     /**
+     * The generation the next publish will use, verified against the Long
+     * domain before anything mutates — like [mintableDocId], the counter must
+     * never wrap: a wrapped negative generation would commit Tantivy and then
+     * publish metadata every later [load] rejects as corrupt.
+     */
+    private fun mintableGeneration(): Long {
+        check(generation != Long.MAX_VALUE) {
+            "commit generation exhausted (generation=$generation)"
+        }
+        return generation + 1
+    }
+
+    /**
      * The publish protocol behind every durable state change: dump the new
      * vector generation, commit Tantivy, atomically publish metadata naming
      * both, then sweep older generations. A crash before the publish leaves
@@ -601,7 +648,7 @@ public class HybridIndex<T> private constructor(
      * as [HybridSearchException.TornCommit].
      */
     private suspend fun commitLocked() {
-        val newGeneration = generation + 1
+        val newGeneration = mintableGeneration()
         persistHnswLocked(newGeneration)
         tantivyIndex.commit()
         generation = newGeneration
