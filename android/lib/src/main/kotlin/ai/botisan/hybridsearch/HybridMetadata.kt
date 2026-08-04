@@ -14,12 +14,23 @@ import kotlinx.serialization.json.put
 
 /**
  * `hybrid.meta.json` — same shape as HybridSearch.swift's metadata (version 1,
- * camelCase keys, distance types as "l2"/"cosine"/"dot"/"l1") plus the
- * Kotlin-only `hasVectorGraph` marker: the committed record of whether HNSW
- * files must exist on disk, so a missing graph is distinguishable corruption
- * rather than silently an empty index. The schemaFingerprint format also
- * differs (derived from the Kotlin schema DSL, not Swift reflection), so index
- * directories were never cross-language portable.
+ * camelCase keys, distance types as "l2"/"cosine"/"dot"/"l1") plus three
+ * Kotlin-only fields making the commit protocol crash-safe:
+ *
+ * - `generation`: each commit cycle writes its vector dump under a fresh
+ *   `hnsw-g<generation>` basename *before* this file is atomically replaced,
+ *   so the metadata always points at a complete dump and a crash mid-cycle
+ *   leaves only sweepable strays.
+ * - `hasVectorGraph`: whether that generation has dump files at all (hnsw_rs
+ *   cannot dump an empty graph), so a missing graph is distinguishable
+ *   corruption rather than silently an empty index.
+ * - `docCount`: the committed Tantivy document count at publish time — load
+ *   cross-checks it (plus a `__doc_id >= nextDocId` probe) against the live
+ *   Tantivy state to detect a crash between Tantivy's commit and this file.
+ *
+ * The schemaFingerprint format also differs from Swift (derived from the
+ * Kotlin schema DSL, not reflection), so index directories were never
+ * cross-language portable.
  */
 internal data class HybridIndexMetadata(
     val version: Int,
@@ -33,6 +44,8 @@ internal data class HybridIndexMetadata(
     val primaryIdField: String,
     val schemaFingerprint: String,
     val hasVectorGraph: Boolean,
+    val generation: Long,
+    val docCount: Long,
 ) {
     companion object {
         const val CURRENT_VERSION = 1
@@ -75,6 +88,8 @@ internal object HybridMetadataStore {
             put("primaryIdField", metadata.primaryIdField)
             put("schemaFingerprint", metadata.schemaFingerprint)
             put("hasVectorGraph", metadata.hasVectorGraph)
+            put("generation", metadata.generation)
+            put("docCount", metadata.docCount)
         }
         val tmp = File(file.parentFile, "${file.name}.tmp")
         FileOutputStream(tmp).use { out ->
@@ -109,6 +124,8 @@ internal object HybridMetadataStore {
                 primaryIdField = root.getValue("primaryIdField").jsonPrimitive.content,
                 schemaFingerprint = root.getValue("schemaFingerprint").jsonPrimitive.content,
                 hasVectorGraph = root.getValue("hasVectorGraph").jsonPrimitive.boolean,
+                generation = root.getValue("generation").jsonPrimitive.long,
+                docCount = root.getValue("docCount").jsonPrimitive.long,
             )
         } catch (e: HybridSearchException) {
             throw e

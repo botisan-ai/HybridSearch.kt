@@ -39,6 +39,16 @@ public sealed class HybridSearchException(message: String) : Exception(message) 
     public class VectorStateCorrupt(detail: String) :
         HybridSearchException("Hybrid vector state corrupt: $detail")
 
+    /**
+     * The committed Tantivy state disagrees with the committed metadata: a
+     * crash interrupted a commit cycle between Tantivy's own commit and the
+     * metadata publish. Failing is deliberate — vectors for the affected
+     * documents cannot be reconstructed, so the caller must rebuild or
+     * restore the index rather than silently reuse document ids.
+     */
+    public class TornCommit(detail: String) :
+        HybridSearchException("Hybrid commit was interrupted: $detail")
+
     public class AlreadyClosed : HybridSearchException("Index is closed")
 }
 

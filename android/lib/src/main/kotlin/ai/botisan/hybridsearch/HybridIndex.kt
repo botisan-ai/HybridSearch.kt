@@ -25,13 +25,22 @@ import kotlinx.coroutines.withContext
  * and delete-by-field (lookup + delete) — runs under one outer mutex on
  * [Dispatchers.IO], so no other caller can interleave between their steps.
  *
- * Durable empty state: hnsw_rs cannot dump a physically empty graph, so an
- * empty index has **no HNSW files** — and the committed metadata records which
- * state is expected (`hasVectorGraph`). [load] treats missing or partial graph
- * files under a populated marker as [HybridSearchException.VectorStateCorrupt]
- * instead of silently downgrading to text-only search, and removes stray
- * files when the committed state is empty. Stale files that cannot be deleted
- * fail loudly ([clear]/[commit] throw) rather than resurrecting on reopen.
+ * Crash-safe commit protocol: each commit dumps vectors under a fresh
+ * `hnsw-g<generation>` basename, commits Tantivy, atomically publishes
+ * metadata naming the generation (plus the committed Tantivy `docCount`), and
+ * only then sweeps older generations. Published metadata therefore always
+ * names a complete dump: a crash mid-cycle leaves only sweepable strays, and
+ * a crash between Tantivy's commit and the publish is detected on [load] as
+ * [HybridSearchException.TornCommit] (docCount cross-check plus a
+ * `__doc_id >= nextDocId` probe) — the affected vectors are not
+ * reconstructable, so that state fails rather than silently reusing ids.
+ *
+ * hnsw_rs cannot dump a physically empty graph, so an empty generation has
+ * **no HNSW files** (`hasVectorGraph` records which state to expect); missing
+ * or partial files — the tombstone sidecar included — under a populated
+ * marker are [HybridSearchException.VectorStateCorrupt], never a silent
+ * downgrade to text-only search. Stale files that cannot be deleted fail
+ * loudly ([clear]/[commit] throw) rather than resurrecting on reopen.
  *
  * Deliberate deviation from the Swift port source: RRF ties are broken
  * deterministically (score desc, then docId asc) — the Swift implementation's
@@ -42,11 +51,10 @@ public class HybridIndex<T> private constructor(
     private val tantivyIndex: TypedTantivyIndex<DocRecord<T>>,
     private var hnswIndex: HnswIndex,
     public val schema: TantivySchema,
-    private val effectiveSchema: TantivySchema,
-    private val recordAdapter: DocIdAdapter<T>,
     private val config: HybridIndexConfig,
     private var nextDocId: Long,
     private var hasVectorGraph: Boolean,
+    private var generation: Long,
     public val primaryIdField: String,
     private val schemaFingerprint: String,
 ) : AutoCloseable {
@@ -96,7 +104,9 @@ public class HybridIndex<T> private constructor(
     public companion object {
         private const val DOC_ID_FIELD = "__doc_id"
         private const val METADATA_FILE_NAME = "hybrid.meta.json"
-        private const val HNSW_BASENAME = "hnsw"
+
+        /** Vector dumps are generation-numbered so a commit never overwrites the published generation in place. */
+        private fun hnswBasename(generation: Long): String = "hnsw-g$generation"
 
         /** Creates a new index; throws [HybridSearchException.IndexAlreadyExists] if one exists at [directory]. */
         public suspend fun <T> create(
@@ -118,15 +128,14 @@ public class HybridIndex<T> private constructor(
                 tantivyIndex = openTantivy(directory, effectiveSchema, recordAdapter),
                 hnswIndex = HnswIndex.create(config.hnswConfig()),
                 schema = schema,
-                effectiveSchema = effectiveSchema,
-                recordAdapter = recordAdapter,
                 config = config,
                 nextDocId = 0,
                 hasVectorGraph = false,
+                generation = 0,
                 primaryIdField = primary,
                 schemaFingerprint = schema.fingerprint(),
             )
-            index.persistMetadata()
+            index.persistMetadataLocked()
             index
         }
 
@@ -156,6 +165,12 @@ public class HybridIndex<T> private constructor(
             if (metadata.nextDocId < 0) {
                 throw HybridSearchException.MetadataCorrupt("negative nextDocId ${metadata.nextDocId}")
             }
+            if (metadata.generation < 0) {
+                throw HybridSearchException.MetadataCorrupt("negative generation ${metadata.generation}")
+            }
+            if (metadata.docCount < 0) {
+                throw HybridSearchException.MetadataCorrupt("negative docCount ${metadata.docCount}")
+            }
 
             val primary = primaryIdField?.also {
                 if (it !in schema.idFieldNames) throw HybridSearchException.InvalidPrimaryIdField(it)
@@ -181,46 +196,80 @@ public class HybridIndex<T> private constructor(
                 throw HybridSearchException.MetadataCorrupt(e.message ?: "invalid hnsw config")
             }
 
-            // The committed metadata says whether HNSW files must exist. A
-            // populated marker with missing/partial files is corruption, never
-            // silently an empty vector leg; an empty marker with stray files
-            // (interrupted clear()/commit()) removes them before trusting the
-            // empty state.
-            val hnsw = if (metadata.hasVectorGraph) {
-                val missing = listOf("$HNSW_BASENAME.hnsw.graph", "$HNSW_BASENAME.hnsw.data")
-                    .filterNot { File(directory, it).exists() }
-                if (missing.isNotEmpty()) {
-                    throw HybridSearchException.VectorStateCorrupt(
-                        "metadata records a persisted vector graph but ${missing.joinToString()} missing",
-                    )
-                }
-                HnswIndex.load(
-                    directory = directory,
-                    basename = HNSW_BASENAME,
-                    dimension = metadata.embeddingDimension,
-                    distanceType = metadata.distanceType,
-                    config = config.hnswConfig(),
-                )
-            } else {
-                deleteHnswFiles(directory)
-                HnswIndex.create(config.hnswConfig())
-            }
-
             val effectiveSchema = schema.extending { u64Field(DOC_ID_FIELD) }
             val recordAdapter = DocIdAdapter(adapter, primary)
-            HybridIndex(
-                baseDir = directory,
-                tantivyIndex = openTantivy(directory, effectiveSchema, recordAdapter),
-                hnswIndex = hnsw,
-                schema = schema,
-                effectiveSchema = effectiveSchema,
-                recordAdapter = recordAdapter,
-                config = config,
-                nextDocId = metadata.nextDocId,
-                hasVectorGraph = metadata.hasVectorGraph,
-                primaryIdField = primary,
-                schemaFingerprint = fingerprint,
-            )
+            val tantivy = openTantivy(directory, effectiveSchema, recordAdapter)
+            try {
+                // Cross-check the committed Tantivy state before trusting the
+                // metadata (or touching any vector file): a crash between
+                // Tantivy's commit and the metadata publish leaves them
+                // disagreeing, and the affected vectors cannot be
+                // reconstructed, so that state must fail — not sweep the graph
+                // as a stray or remint already-committed doc ids.
+                val committedCount = tantivy.count()
+                if (committedCount != metadata.docCount) {
+                    throw HybridSearchException.TornCommit(
+                        "Tantivy holds $committedCount committed documents but metadata recorded ${metadata.docCount}",
+                    )
+                }
+                val probe = tantivy.search(
+                    TantivyQuery.Range(DOC_ID_FIELD, lower = TantivyValue.U64(metadata.nextDocId)),
+                    limit = 1,
+                )
+                if (probe.count > 0) {
+                    throw HybridSearchException.TornCommit(
+                        "Tantivy holds a document with $DOC_ID_FIELD >= recorded nextDocId ${metadata.nextDocId}",
+                    )
+                }
+
+                // The committed metadata says which generation's HNSW files
+                // must exist. A populated marker with any of the three files
+                // missing (tombstone sidecar included — without it deleted
+                // vectors would resurrect) is corruption, never silently an
+                // empty or partial vector leg.
+                val basename = hnswBasename(metadata.generation)
+                val hnsw = if (metadata.hasVectorGraph) {
+                    val missing = listOf("$basename.hnsw.graph", "$basename.hnsw.data", "$basename.deleted")
+                        .filterNot { File(directory, it).exists() }
+                    if (missing.isNotEmpty()) {
+                        throw HybridSearchException.VectorStateCorrupt(
+                            "metadata records vector generation ${metadata.generation} but ${missing.joinToString()} missing",
+                        )
+                    }
+                    HnswIndex.load(
+                        directory = directory,
+                        basename = basename,
+                        dimension = metadata.embeddingDimension,
+                        distanceType = metadata.distanceType,
+                        config = config.hnswConfig(),
+                    )
+                } else {
+                    HnswIndex.create(config.hnswConfig())
+                }
+                // Only after every check passed are other hnsw* files provably
+                // strays of interrupted or superseded cycles.
+                try {
+                    sweepHnswFiles(directory, keep = if (metadata.hasVectorGraph) basename else null)
+                } catch (t: Throwable) {
+                    hnsw.close()
+                    throw t
+                }
+                HybridIndex(
+                    baseDir = directory,
+                    tantivyIndex = tantivy,
+                    hnswIndex = hnsw,
+                    schema = schema,
+                    config = config,
+                    nextDocId = metadata.nextDocId,
+                    hasVectorGraph = metadata.hasVectorGraph,
+                    generation = metadata.generation,
+                    primaryIdField = primary,
+                    schemaFingerprint = fingerprint,
+                )
+            } catch (t: Throwable) {
+                tantivy.close()
+                throw t
+            }
         }
 
         public suspend fun <T> load(
@@ -277,12 +326,17 @@ public class HybridIndex<T> private constructor(
             return TypedTantivyIndex.open(tantivyDir, effectiveSchema, recordAdapter)
         }
 
-        /** Removes the HNSW dump/sidecar files, throwing when one survives deletion. */
-        private fun deleteHnswFiles(directory: File) {
-            val names = listOf("$HNSW_BASENAME.hnsw.graph", "$HNSW_BASENAME.hnsw.data", "$HNSW_BASENAME.deleted")
-            for (name in names) {
-                val file = File(directory, name)
-                if (file.exists() && !file.delete()) {
+        /**
+         * Removes every HNSW dump/sidecar file except the [keep] generation's
+         * (all of them when [keep] is null), throwing when one survives
+         * deletion — stale dumps must not resurrect on a later load.
+         */
+        private fun sweepHnswFiles(directory: File, keep: String?) {
+            val files = directory.listFiles() ?: return
+            for (file in files) {
+                if (!file.isFile || !file.name.startsWith("hnsw")) continue
+                if (keep != null && file.name.startsWith("$keep.")) continue
+                if (!file.delete()) {
                     throw HybridSearchException.VectorStateCorrupt(
                         "could not delete stale vector file ${file.absolutePath}",
                     )
@@ -436,22 +490,22 @@ public class HybridIndex<T> private constructor(
 
     public suspend fun compact(): Unit = locked {
         hnswIndex.compact(config.hnswConfig())
-        persistHnswLocked()
-        persistMetadata() // compacting away the last points flips hasVectorGraph
+        commitLocked() // compacting away the last points flips hasVectorGraph
     }
 
     /** Removes every document and vector, durably: reopening after clear yields an empty index. */
     public suspend fun clear(): Unit = locked {
         tantivyIndex.clear()
         // Files before state: if a stale dump cannot be removed, fail here —
-        // with the marker still true — instead of recording an empty state a
-        // reopen would contradict. The in-memory graph is still intact.
-        deleteHnswFiles(baseDir)
+        // before the metadata records an empty state a reopen would
+        // contradict. The in-memory graph is still intact when that happens.
+        sweepHnswFiles(baseDir, keep = null)
         hnswIndex.close()
         hnswIndex = HnswIndex.create(config.hnswConfig())
         nextDocId = 0
+        generation += 1
         hasVectorGraph = false
-        persistMetadata()
+        persistMetadataLocked()
     }
 
     /** Waits for in-flight operations, then closes both underlying indexes. Idempotent. */
@@ -472,20 +526,17 @@ public class HybridIndex<T> private constructor(
     private suspend fun addLocked(doc: T, embedding: FloatArray): Long {
         validateEmbedding(embedding)
         val docId = mintableDocId(count = 1)
-        // Programmer errors (unknown/reserved fields, wrong value kinds,
-        // primary-id cardinality) must surface before the vector enters the
-        // insert-only graph: a rejected document leaves no tombstoned point
-        // and does not advance the id counter.
-        preflightEncode(doc, docId)
-
-        hnswIndex.insert(embedding, docId)
+        // Tantivy first: the write's own single adapter encode is the
+        // validation (unknown/reserved fields, wrong value kinds, primary-id
+        // cardinality), and it runs before the document reaches any FFI or
+        // the insert-only vector graph. A rejected document therefore leaves
+        // no tombstoned point and does not advance the id counter — and no
+        // second encode exists for a stateful adapter to fail differently on.
+        tantivyIndex.add(DocRecord(doc, docId))
         try {
-            tantivyIndex.add(DocRecord(doc, docId))
+            hnswIndex.insert(embedding, docId)
         } catch (e: Exception) {
-            // Post-validation failure (I/O etc.): the vector is already in the
-            // insert-only graph, so tombstone it and burn its id.
-            hnswIndex.delete(docId)
-            nextDocId = docId + 1
+            rollBackDanglingText(listOf(docId), e)
             throw e
         }
         nextDocId = docId + 1
@@ -497,19 +548,37 @@ public class HybridIndex<T> private constructor(
         docs.forEach { validateEmbedding(it.embedding) }
         val first = mintableDocId(count = docs.size)
         val docIds = docs.indices.map { first + it }
-        // Validate the whole batch before any mutation, like the single path.
-        docs.zip(docIds).forEach { (d, docId) -> preflightEncode(d.document, docId) }
-
-        hnswIndex.insertBatch(docs.map { it.embedding }, docIds)
+        // Single encode per document, all before the batch reaches Tantivy's
+        // FFI or the vector graph: one rejected document rejects the batch
+        // with nothing mutated anywhere.
+        tantivyIndex.addAll(docs.zip(docIds) { d, docId -> DocRecord(d.document, docId) })
         try {
-            tantivyIndex.addAll(docs.zip(docIds) { d, docId -> DocRecord(d.document, docId) })
+            hnswIndex.insertBatch(docs.map { it.embedding }, docIds)
         } catch (e: Exception) {
-            docIds.forEach { hnswIndex.delete(it) }
-            nextDocId = docIds.last() + 1
+            rollBackDanglingText(docIds, e)
             throw e
         }
         nextDocId = docIds.last() + 1
         return docIds
+    }
+
+    /**
+     * A vector insert failed after its text write: remove the uncommitted
+     * text documents (deleteDoc commits internally — Rust behavior), tombstone
+     * whatever may have physically landed in the insert-only graph, burn the
+     * ids, and republish a consistent durable state so the involuntary Tantivy
+     * commit cannot read as a torn commit on the next load. Rollback failures
+     * ride along as suppressed exceptions.
+     */
+    private suspend fun rollBackDanglingText(docIds: List<Long>, cause: Exception) {
+        try {
+            docIds.forEach { tantivyIndex.deleteDoc(DOC_ID_FIELD, TantivyValue.U64(it)) }
+            docIds.forEach { hnswIndex.delete(it) }
+            nextDocId = docIds.last() + 1
+            commitLocked()
+        } catch (rollback: Exception) {
+            cause.addSuppressed(rollback)
+        }
     }
 
     /**
@@ -523,39 +592,44 @@ public class HybridIndex<T> private constructor(
         return nextDocId
     }
 
-    /** Runs the full adapter/schema validation on a throwaway writer — no FFI, no state. */
-    private fun preflightEncode(doc: T, docId: Long) {
-        recordAdapter.encode(DocRecord(doc, docId), TantivyDocumentWriter(effectiveSchema))
-    }
-
+    /**
+     * The publish protocol behind every durable state change: dump the new
+     * vector generation, commit Tantivy, atomically publish metadata naming
+     * both, then sweep older generations. A crash before the publish leaves
+     * the previous generation intact (the new files are sweepable strays); a
+     * crash after Tantivy's commit but before the publish is detected on load
+     * as [HybridSearchException.TornCommit].
+     */
     private suspend fun commitLocked() {
+        val newGeneration = generation + 1
+        persistHnswLocked(newGeneration)
         tantivyIndex.commit()
-        persistHnswLocked()
+        generation = newGeneration
+        persistMetadataLocked()
         hnswIndex.setSearchingMode(true)
-        persistMetadata()
+        sweepHnswFiles(baseDir, keep = if (hasVectorGraph) hnswBasename(newGeneration) else null)
     }
 
     private suspend fun deleteLocked(docId: Long, persist: Boolean) {
         tantivyIndex.deleteDoc(DOC_ID_FIELD, TantivyValue.U64(docId))
         hnswIndex.delete(docId)
         if (persist) {
-            persistHnswLocked()
-            persistMetadata()
+            commitLocked()
         }
     }
 
     /**
-     * Persists vector state and tracks the marker the metadata will commit. A
-     * physically empty graph cannot be dumped (hnsw_rs limitation), so empty
-     * == no files on disk; a fully-tombstoned graph still dumps, carrying its
-     * tombstones. Undeletable stale files throw instead of surviving silently.
+     * Dumps vector state for [newGeneration] and tracks the marker the
+     * metadata will publish. A physically empty graph cannot be dumped
+     * (hnsw_rs limitation), so empty == no files for that generation; a
+     * fully-tombstoned graph still dumps, carrying its tombstones. The
+     * previous generation's files are untouched until the post-publish sweep.
      */
-    private suspend fun persistHnswLocked() {
+    private suspend fun persistHnswLocked(newGeneration: Long) {
         if (hnswIndex.graphSize() == 0L) {
-            deleteHnswFiles(baseDir)
             hasVectorGraph = false
         } else {
-            hnswIndex.save(baseDir, HNSW_BASENAME)
+            hnswIndex.save(baseDir, hnswBasename(newGeneration))
             hasVectorGraph = true
         }
     }
@@ -581,7 +655,7 @@ public class HybridIndex<T> private constructor(
         return (desired * overfetchMultiplier).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     }
 
-    private fun persistMetadata() {
+    private suspend fun persistMetadataLocked() {
         HybridMetadataStore.save(
             HybridIndexMetadata(
                 version = HybridIndexMetadata.CURRENT_VERSION,
@@ -595,6 +669,8 @@ public class HybridIndex<T> private constructor(
                 primaryIdField = primaryIdField,
                 schemaFingerprint = schemaFingerprint,
                 hasVectorGraph = hasVectorGraph,
+                generation = generation,
+                docCount = tantivyIndex.count(),
             ),
             metadataFile,
         )

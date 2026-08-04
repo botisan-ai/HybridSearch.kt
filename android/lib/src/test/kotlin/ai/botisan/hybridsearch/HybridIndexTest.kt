@@ -71,6 +71,10 @@ class HybridIndexTest {
 
     private fun tempPath(): String = Files.createTempDirectory("hybrid_test_").toFile().absolutePath
 
+    /** Every HNSW dump/sidecar file in the directory, any generation. */
+    private fun hnswFiles(path: String): List<String> =
+        File(path).listFiles().orEmpty().filter { it.isFile && it.name.startsWith("hnsw") }.map { it.name }.sorted()
+
     private suspend fun makeSeededIndex(path: String = tempPath()): Pair<HybridIndex<TestDoc>, List<Long>> {
         val index = HybridIndex.create(path, schema, TestDocAdapter, config)
         val docIds = index.addAll(docs)
@@ -228,12 +232,10 @@ class HybridIndexTest {
     fun clearRemovesVectorFilesAndSurvivesReopen() = runTest {
         val path = tempPath()
         val (index, _) = makeSeededIndex(path)
-        assertTrue(File(path, "hnsw.hnsw.graph").exists())
+        assertTrue(File(path, "hnsw-g1.hnsw.graph").exists())
 
         index.clear()
-        assertFalse(File(path, "hnsw.hnsw.graph").exists())
-        assertFalse(File(path, "hnsw.hnsw.data").exists())
-        assertFalse(File(path, "hnsw.deleted").exists())
+        assertEquals(emptyList<String>(), hnswFiles(path))
         assertEquals(0L, index.count())
         index.close()
 
@@ -437,7 +439,7 @@ class HybridIndexTest {
             // Rejection happened before any FFI mutation: repeated programmer
             // errors left no (tombstoned) points — an empty commit writes no
             // dump files — and never advanced the id counter.
-            assertFalse(File(path, "hnsw.hnsw.graph").exists())
+            assertEquals(emptyList<String>(), hnswFiles(path))
             assertEquals(0L, index.index(docs[0].document, docs[0].embedding))
         }
     }
@@ -521,7 +523,7 @@ class HybridIndexTest {
     fun missingGraphFileOnAPopulatedIndexIsCorruptionNotEmpty() = runTest {
         val path = tempPath()
         makeSeededIndex(path).first.close()
-        assertTrue(File(path, "hnsw.hnsw.graph").delete())
+        assertTrue(File(path, "hnsw-g1.hnsw.graph").delete())
 
         try {
             HybridIndex.load(path, schema, TestDocAdapter)
@@ -534,7 +536,7 @@ class HybridIndexTest {
     fun partialVectorFilesOnAPopulatedIndexAreCorruption() = runTest {
         val path = tempPath()
         makeSeededIndex(path).first.close()
-        assertTrue(File(path, "hnsw.hnsw.data").delete()) // graph present, data gone
+        assertTrue(File(path, "hnsw-g1.hnsw.data").delete()) // graph present, data gone
 
         try {
             HybridIndex.load(path, schema, TestDocAdapter)
@@ -547,15 +549,16 @@ class HybridIndexTest {
     fun strayVectorFilesUnderAnEmptyMarkerAreRemovedOnLoad() = runTest {
         val path = tempPath()
         HybridIndex.create(path, schema, TestDocAdapter, config).use { it.commit() }
-        // Leftovers of an interrupted clear()/commit(): the committed marker
-        // says empty, so these must be swept, not loaded.
+        // Leftovers of an interrupted clear()/commit() — legacy-named or
+        // generation-named: the committed marker says empty, so these must be
+        // swept, not loaded.
         File(path, "hnsw.hnsw.graph").writeBytes(byteArrayOf(1, 2, 3))
         File(path, "hnsw.deleted").writeBytes(ByteArray(8))
+        File(path, "hnsw-g7.hnsw.graph").writeBytes(byteArrayOf(4, 5, 6))
 
         HybridIndex.load(path, schema, TestDocAdapter).use { reopened ->
             assertEquals(0L, reopened.count())
-            assertFalse(File(path, "hnsw.hnsw.graph").exists())
-            assertFalse(File(path, "hnsw.deleted").exists())
+            assertEquals(emptyList<String>(), hnswFiles(path))
             reopened.index(docs[0].document, docs[0].embedding)
             assertEquals(1L, reopened.count())
         }
@@ -581,9 +584,124 @@ class HybridIndexTest {
         // Observable and recoverable: once deletion works again, clear() does too.
         index.clear()
         assertEquals(0L, index.count())
-        assertFalse(File(path, "hnsw.hnsw.graph").exists())
+        assertEquals(emptyList<String>(), hnswFiles(path))
         index.close()
         HybridIndex.load(path, schema, TestDocAdapter).use { assertEquals(0L, it.count()) }
+    }
+
+    // -- HY2/HY3: crash-safe commit protocol -----------------------------------------
+
+    @Test
+    fun interruptedFirstCommitFailsLoadAsTornCommitInsteadOfSweepingTheGraph() = runTest {
+        val path = tempPath()
+        val meta = File(path, "hybrid.meta.json")
+        val index = HybridIndex.create(path, schema, TestDocAdapter, config)
+        val pristineMetadata = meta.readBytes() // what a crash before the publish leaves behind
+        index.index(docs[0].document, docs[0].embedding)
+        index.close()
+
+        // Simulate the review scenario: Tantivy committed and the graph
+        // dumped, but the crash struck before the metadata publish — the file
+        // still says hasVectorGraph=false / nextDocId=0 / docCount=0.
+        meta.writeBytes(pristineMetadata)
+        try {
+            HybridIndex.load(path, schema, TestDocAdapter)
+            fail("expected TornCommit")
+        } catch (_: HybridSearchException.TornCommit) {
+        }
+        // The graph was NOT deleted as a "stray" and no doc id was reused:
+        // the failed load changed nothing on disk.
+        assertTrue(File(path, "hnsw-g1.hnsw.graph").exists())
+    }
+
+    @Test
+    fun countNeutralTornCommitIsDetectedByTheDocIdProbe() = runTest {
+        val path = tempPath()
+        val meta = File(path, "hybrid.meta.json")
+        val index = HybridIndex.create(path, schema, TestDocAdapter, config)
+        index.index(docs[0].document, docs[0].embedding) // docId 0
+        val publishedMetadata = meta.readBytes() // nextDocId=1, docCount=1
+        index.delete(0L) // committed count back to 0
+        index.index(docs[1].document, docs[1].embedding) // docId 1, committed count 1 again
+        index.close()
+
+        // Committed count matches the stale metadata (1 == 1), so only the
+        // __doc_id >= nextDocId probe can prove a later add was committed.
+        meta.writeBytes(publishedMetadata)
+        try {
+            HybridIndex.load(path, schema, TestDocAdapter)
+            fail("expected TornCommit")
+        } catch (e: HybridSearchException.TornCommit) {
+            assertTrue(e.message.orEmpty().contains("__doc_id"))
+        }
+    }
+
+    @Test
+    fun missingTombstoneSidecarOnAPopulatedIndexIsCorruption() = runTest {
+        val path = tempPath()
+        val (index, docIds) = makeSeededIndex(path)
+        index.delete(docIds[0])
+        index.close()
+        // Losing the sidecar would resurrect the deleted vector (HnswIndex
+        // treats a missing sidecar as "no tombstones"), so a marker-managed
+        // index must refuse to load without it.
+        assertTrue(File(path, "hnsw-g2.deleted").delete())
+
+        try {
+            HybridIndex.load(path, schema, TestDocAdapter)
+            fail("expected VectorStateCorrupt")
+        } catch (e: HybridSearchException.VectorStateCorrupt) {
+            assertTrue(e.message.orEmpty().contains(".deleted"))
+        }
+    }
+
+    @Test
+    fun newGenerationStraysFromACrashedCommitAreSweptAndThePublishedGenerationLoads() = runTest {
+        val path = tempPath()
+        makeSeededIndex(path).first.close()
+        // A crash after the generation-2 dump but before Tantivy's commit and
+        // the metadata publish: generation 1 stays authoritative.
+        File(path, "hnsw-g2.hnsw.graph").writeBytes(byteArrayOf(1, 2, 3))
+        File(path, "hnsw-g2.hnsw.data").writeBytes(byteArrayOf(4, 5, 6))
+        File(path, "hnsw-g2.deleted").writeBytes(ByteArray(8))
+
+        HybridIndex.load(path, schema, TestDocAdapter).use { reopened ->
+            assertEquals(4L, reopened.count())
+            assertEquals(listOf("hnsw-g1.deleted", "hnsw-g1.hnsw.data", "hnsw-g1.hnsw.graph"), hnswFiles(path))
+            assertEquals(
+                "swift-1",
+                reopened.searchVector(TestEmbeddings.querySwift, limit = 1, efSearch = 50).first().document.id,
+            )
+        }
+    }
+
+    // -- HY6: the adapter encodes each document exactly once ---------------------------
+
+    @Test
+    fun adapterEncodesEachDocumentExactlyOnceAcrossAddAndAddAll() = runTest {
+        // Poison pill for a second encode: nothing in the adapter contract
+        // promises purity, so an adapter may legally misbehave when re-invoked
+        // for the same document — the old preflight+re-encode design turned
+        // that into a tombstoned point and a burned id after passing
+        // validation.
+        val encodeCounts = mutableMapOf<String, Int>()
+        val poisonOnSecondEncode = object : TantivyDocumentAdapter<TestDoc> {
+            override fun encode(value: TestDoc, doc: TantivyDocumentWriter) {
+                val calls = encodeCounts.merge(value.id, 1, Int::plus)!!
+                TestDocAdapter.encode(value, doc)
+                if (calls > 1) doc.u64("__doc_id", 999) // reserved — only reachable on a re-encode
+            }
+
+            override fun decode(fields: TantivyFieldMap): TestDoc = TestDocAdapter.decode(fields)
+        }
+        val path = tempPath()
+        HybridIndex.create(path, schema, poisonOnSecondEncode, config).use { index ->
+            assertEquals(0L, index.index(docs[0].document, docs[0].embedding))
+            assertEquals(listOf(1L, 2L), index.addAll(listOf(docs[1], docs[2])))
+            index.commit()
+            assertEquals(mapOf("swift-1" to 1, "rust-1" to 1, "vector-1" to 1), encodeCounts)
+            assertEquals(3L, index.count())
+        }
     }
 
     // -- HY5: docId counter domain --------------------------------------------------
@@ -632,7 +750,7 @@ class HybridIndexTest {
         // The failed adds mutated nothing: no documents, no vector files.
         HybridIndex.load(path, schema, TestDocAdapter).use { reopened ->
             assertEquals(0L, reopened.count())
-            assertFalse(File(path, "hnsw.hnsw.graph").exists())
+            assertEquals(emptyList<String>(), hnswFiles(path))
         }
     }
 
