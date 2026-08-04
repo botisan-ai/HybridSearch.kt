@@ -9,6 +9,9 @@ cd "$(dirname "$0")"
 
 ARTIFACT="hybridsearch-android"
 VERSION=$(grep '^version=' android/gradle.properties | cut -d= -f2)
+TANTIVY_VERSION="${TANTIVY_VERSION:-0.2.0}"
+HNSW_VERSION="${HNSW_VERSION:-0.2.0}"
+export TANTIVY_VERSION HNSW_VERSION
 
 # Fetch the *released* dependency zips first (checksummed downloads): the
 # gates below then build against the same repos consumers will resolve, and a
@@ -47,8 +50,8 @@ fi
 # zip being shipped — against the *downloaded release* repos of tantivy/hnsw,
 # never the sibling dev checkouts — from a cache-isolated consumer.
 unzip -qo "$STAGING/$ARTIFACT-$VERSION-maven.zip" -d "$UNZIPPED"
-TANTIVY_REPO=$(ls -d android/build/native-repos/tantivy-android-*/ | head -1)
-HNSW_REPO=$(ls -d android/build/native-repos/hnsw-android-*/ | head -1)
+TANTIVY_REPO="android/build/native-repos/tantivy-android-$TANTIVY_VERSION"
+HNSW_REPO="android/build/native-repos/hnsw-android-$HNSW_VERSION"
 ./verify-consumer-resolution.sh "ai.botisan:$ARTIFACT:$VERSION" "$UNZIPPED" "$TANTIVY_REPO" "$HNSW_REPO"
 
 (cd "$STAGING" \
