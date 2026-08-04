@@ -24,8 +24,8 @@ android {
 }
 
 dependencies {
-    api("ai.botisan:tantivy-android:0.1.0")
-    api("ai.botisan:hnsw-android:0.1.0")
+    api("ai.botisan:tantivy-android:0.2.0")
+    api("ai.botisan:hnsw-android:0.2.0")
     api("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
 
