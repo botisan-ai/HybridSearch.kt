@@ -31,11 +31,13 @@ trap 'rm -rf "$STAGING" "$UNZIPPED"' EXIT
 cp "android/lib/build/outputs/aar/lib-release.aar" "$STAGING/$ARTIFACT-$VERSION.aar"
 
 echo "==> asserting zip layout resolves the documented Maven path"
-if ! unzip -l "$STAGING/$ARTIFACT-$VERSION-maven.zip" | grep -q "ai/botisan/$ARTIFACT/$VERSION/$ARTIFACT-$VERSION.aar"; then
+ZIP_ENTRIES=$(unzip -Z1 "$STAGING/$ARTIFACT-$VERSION-maven.zip")
+EXPECTED_AAR="ai/botisan/$ARTIFACT/$VERSION/$ARTIFACT-$VERSION.aar"
+if ! grep -Fqx "$EXPECTED_AAR" <<< "$ZIP_ENTRIES"; then
   echo "FAIL: maven zip does not contain ai/botisan/$ARTIFACT/$VERSION/$ARTIFACT-$VERSION.aar at its root" >&2
   exit 1
 fi
-if unzip -l "$STAGING/$ARTIFACT-$VERSION-maven.zip" | grep -q " maven-repo/"; then
+if grep -Eq '(^|/)maven-repo/' <<< "$ZIP_ENTRIES"; then
   echo "FAIL: maven zip contains a maven-repo/ wrapper directory" >&2
   exit 1
 fi
