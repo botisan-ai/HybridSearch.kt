@@ -7,6 +7,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+BUILD_TOOLS_PIN="36.1.0"
+ZIPALIGN="$ANDROID_HOME/build-tools/$BUILD_TOOLS_PIN/zipalign"
+if [ ! -x "$ZIPALIGN" ]; then
+  echo "FAIL: Android build-tools $BUILD_TOOLS_PIN not installed (expected $ZIPALIGN)" >&2
+  exit 1
+fi
+
 ARTIFACT="hybridsearch-android"
 VERSION=$(grep '^version=' android/gradle.properties | cut -d= -f2)
 TANTIVY_VERSION="${TANTIVY_VERSION:-0.2.0}"
@@ -19,8 +27,16 @@ export TANTIVY_VERSION HNSW_VERSION
 echo "==> release channel deps (bootstrap-deps.sh)"
 ./bootstrap-deps.sh
 
-echo "==> release gates (test + lintRelease + assembleRelease)"
-(cd android && ./gradlew --console=plain test lintRelease assembleRelease)
+echo "==> release gates (test + lintRelease + assembleRelease + test APK)"
+(cd android && ./gradlew --console=plain test lintRelease assembleRelease :lib:assembleDebugAndroidTest)
+
+echo "==> APK 16 KB ZIP-alignment gate"
+TEST_APK="android/lib/build/outputs/apk/androidTest/debug/lib-debug-androidTest.apk"
+if [ ! -f "$TEST_APK" ]; then
+  echo "FAIL: missing packaged instrumentation APK: $TEST_APK" >&2
+  exit 1
+fi
+"$ZIPALIGN" -c -P 16 -v 4 "$TEST_APK"
 
 echo "==> publishing $ARTIFACT $VERSION to a fresh local maven layout"
 rm -rf android/build/maven-repo
