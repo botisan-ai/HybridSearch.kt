@@ -892,6 +892,41 @@ class HybridIndexTest {
         meta.writeText(rewritten)
     }
 
+    /** Creates a valid published generation, then moves that exact state to the last representable generation. */
+    private suspend fun maxGenerationPath(tombstoneOnly: Boolean = false): String {
+        val path = tempPath()
+        val publishedGeneration = if (tombstoneOnly) 2L else 1L
+        HybridIndex.create(path, schema, TestDocAdapter, config).use { index ->
+            val docId = index.index(docs[0].document, docs[0].embedding)
+            if (tombstoneOnly) index.delete(docId)
+        }
+
+        val meta = File(path, "hybrid.meta.json")
+        val before = meta.readText()
+        val rewritten = before.replace(
+            "\"generation\":$publishedGeneration",
+            "\"generation\":${Long.MAX_VALUE}",
+        )
+        check(rewritten != before) { "generation not found in metadata" }
+        meta.writeText(rewritten)
+        for (suffix in listOf("hnsw.graph", "hnsw.data", "deleted")) {
+            check(
+                File(path, "hnsw-g$publishedGeneration.$suffix")
+                    .renameTo(File(path, "hnsw-g${Long.MAX_VALUE}.$suffix")),
+            )
+        }
+        return path
+    }
+
+    private suspend fun expectGenerationExhausted(block: suspend () -> Unit) {
+        try {
+            block()
+            fail("expected IllegalStateException")
+        } catch (e: IllegalStateException) {
+            assertTrue(e.message.orEmpty().contains("generation"))
+        }
+    }
+
     @Test
     fun negativeNextDocIdInMetadataFailsLoad() = runTest {
         val path = tempPath()
@@ -964,39 +999,94 @@ class HybridIndexTest {
     }
 
     @Test
-    fun generationExhaustionFailsBeforeAnyMutation() = runTest {
-        val path = tempPath()
+    fun exhaustedGenerationRejectsIndexBeforeIdsOrVectorsMutate() = runTest {
+        val path = maxGenerationPath()
+        HybridIndex.load(path, schema, TestDocAdapter).use { index ->
+            val graphSize = index.vectorGraphSizeForTest()
+
+            expectGenerationExhausted { index.index(docs[1].document, docs[1].embedding) }
+
+            assertEquals(graphSize, index.vectorGraphSizeForTest())
+            // A non-publishing add is still legal and must receive the ID that
+            // the rejected index() would otherwise have consumed.
+            assertEquals(1L, index.add(docs[1].document, docs[1].embedding))
+        }
+        HybridIndex.load(path, schema, TestDocAdapter).use { reopened ->
+            assertEquals(1L, reopened.count())
+            assertNull(reopened.get(1L))
+            assertEquals(1L, reopened.vectorGraphSizeForTest())
+        }
+    }
+
+    @Test
+    fun exhaustedGenerationRejectsIndexAllBeforeIdsOrVectorsMutate() = runTest {
+        val path = maxGenerationPath()
+        HybridIndex.load(path, schema, TestDocAdapter).use { index ->
+            val graphSize = index.vectorGraphSizeForTest()
+
+            expectGenerationExhausted { index.indexAll(listOf(docs[1], docs[2])) }
+
+            assertEquals(graphSize, index.vectorGraphSizeForTest())
+            assertEquals(1L, index.add(docs[1].document, docs[1].embedding))
+        }
+    }
+
+    @Test
+    fun exhaustedGenerationRejectsCompactBeforeTheVectorGraphMutates() = runTest {
+        val path = maxGenerationPath(tombstoneOnly = true)
+        HybridIndex.load(path, schema, TestDocAdapter).use { index ->
+            assertEquals(0L, index.count())
+            val graphSize = index.vectorGraphSizeForTest()
+            assertEquals(1L, graphSize) // the one deleted point is still physically tombstoned
+
+            expectGenerationExhausted { index.compact() }
+
+            assertEquals(graphSize, index.vectorGraphSizeForTest())
+        }
+        HybridIndex.load(path, schema, TestDocAdapter).use { reopened ->
+            assertEquals(0L, reopened.count())
+            assertEquals(1L, reopened.vectorGraphSizeForTest())
+        }
+    }
+
+    @Test
+    fun exhaustedGenerationRejectsPersistentDeleteBeforeDurableMutation() = runTest {
+        val path = maxGenerationPath()
         val meta = File(path, "hybrid.meta.json")
-        HybridIndex.create(path, schema, TestDocAdapter, config).use { index ->
-            index.index(docs[0].document, docs[0].embedding) // generation 1
+        val metadataBefore = meta.readBytes()
+        val filesBefore = hnswFiles(path)
+
+        HybridIndex.load(path, schema, TestDocAdapter).use { index ->
+            val graphSize = index.vectorGraphSizeForTest()
+
+            expectGenerationExhausted { index.delete(0L) }
+            expectGenerationExhausted { index.delete("id", TantivyValue.Text("swift-1")) }
+
+            assertEquals(1L, index.count())
+            assertNotNull(index.get(0L))
+            assertEquals(graphSize, index.vectorGraphSizeForTest())
+            assertTrue(meta.readBytes().contentEquals(metadataBefore))
+            assertEquals(filesBefore, hnswFiles(path))
         }
-        // A maximal-but-valid generation loads fine; only advancing past it
-        // must fail — before the dump, the Tantivy commit, or the publish,
-        // never after (a wrapped negative generation would publish metadata
-        // every later load rejects).
-        val max = Long.MAX_VALUE
-        val doctored = meta.readText().replace("\"generation\":1", "\"generation\":$max")
-        check(doctored != meta.readText()) { "generation not found in metadata" }
-        meta.writeText(doctored)
-        for (suffix in listOf("hnsw.graph", "hnsw.data", "deleted")) {
-            check(File(path, "hnsw-g1.$suffix").renameTo(File(path, "hnsw-g$max.$suffix")))
+        HybridIndex.load(path, schema, TestDocAdapter).use { reopened ->
+            assertEquals(1L, reopened.count())
+            assertNotNull(reopened.get(0L))
+            assertEquals(1L, reopened.vectorGraphSizeForTest())
         }
+    }
+
+    @Test
+    fun exhaustedGenerationRejectsCommitAndClearBeforeDurableMutation() = runTest {
+        val path = maxGenerationPath()
+        val meta = File(path, "hybrid.meta.json")
 
         HybridIndex.load(path, schema, TestDocAdapter).use { index ->
             val before = meta.readBytes()
             val filesBefore = hnswFiles(path)
-            suspend fun expectExhausted(block: suspend () -> Unit) {
-                try {
-                    block()
-                    fail("expected IllegalStateException")
-                } catch (e: IllegalStateException) {
-                    assertTrue(e.message.orEmpty().contains("generation"))
-                }
-            }
-            // The commit path fails before dumping or committing anything...
-            expectExhausted { index.index(docs[1].document, docs[1].embedding) }
-            // ...and clear() fails before Tantivy is durably cleared.
-            expectExhausted { index.clear() }
+
+            expectGenerationExhausted { index.commit() }
+            expectGenerationExhausted { index.clear() }
+
             assertEquals(1L, index.count())
             assertTrue(meta.readBytes().contentEquals(before))
             assertEquals(filesBefore, hnswFiles(path))

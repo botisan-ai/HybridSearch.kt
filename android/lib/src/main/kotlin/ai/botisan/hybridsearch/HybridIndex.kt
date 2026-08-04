@@ -377,27 +377,31 @@ public class HybridIndex<T> private constructor(
 
     /** Adds and commits — one atomic operation with respect to other callers. */
     public suspend fun index(doc: T, embedding: FloatArray): Long = locked {
+        val reservedGeneration = mintableGeneration()
         val docId = addLocked(doc, embedding)
-        commitLocked()
+        commitLocked(reservedGeneration)
         docId
     }
 
     public suspend fun indexAll(docs: List<HybridDocument<T>>): List<Long> = locked {
+        val reservedGeneration = mintableGeneration()
         val docIds = addAllLocked(docs)
-        commitLocked()
+        commitLocked(reservedGeneration)
         docIds
     }
 
     public suspend fun commit(): Unit = locked { commitLocked() }
 
     public suspend fun delete(docId: Long, persist: Boolean = true): Unit = locked {
-        deleteLocked(docId, persist)
+        val reservedGeneration = if (persist) mintableGeneration() else null
+        deleteLocked(docId, reservedGeneration)
     }
 
     /** Deletes by an id field value; no-op when the document is absent (Swift parity). Lookup and delete run under one lock. */
     public suspend fun delete(idField: String, idValue: TantivyValue, persist: Boolean = true): Unit = locked {
         val record = tantivyIndex.getDocOrNull(idField, idValue) ?: return@locked
-        deleteLocked(record.docId, persist)
+        val reservedGeneration = if (persist) mintableGeneration() else null
+        deleteLocked(record.docId, reservedGeneration)
     }
 
     public suspend fun get(docId: Long): T? = locked {
@@ -510,13 +514,14 @@ public class HybridIndex<T> private constructor(
     )
 
     public suspend fun compact(): Unit = locked {
+        val reservedGeneration = mintableGeneration()
         hnswIndex.compact(config.hnswConfig())
-        commitLocked() // compacting away the last points flips hasVectorGraph
+        commitLocked(reservedGeneration) // compacting away the last points flips hasVectorGraph
     }
 
     /** Removes every document and vector, durably: reopening after clear yields an empty index. */
     public suspend fun clear(): Unit = locked {
-        val newGeneration = mintableGeneration() // before Tantivy is durably cleared
+        val reservedGeneration = mintableGeneration() // before Tantivy is durably cleared
         tantivyIndex.clear()
         // Files before state: if a stale dump cannot be removed, fail here —
         // before the metadata records an empty state a reopen would
@@ -525,7 +530,7 @@ public class HybridIndex<T> private constructor(
         hnswIndex.close()
         hnswIndex = HnswIndex.create(config.hnswConfig())
         nextDocId = 0
-        generation = newGeneration
+        generation = reservedGeneration
         hasVectorGraph = false
         persistMetadataLocked()
     }
@@ -593,6 +598,9 @@ public class HybridIndex<T> private constructor(
     // deterministically.
     internal var vectorInsertFailureForTest: ((List<Long>) -> Unit)? = null
 
+    /** Read-only physical graph observation for pre-mutation regressions. */
+    internal suspend fun vectorGraphSizeForTest(): Long = locked { hnswIndex.graphSize() }
+
     /**
      * A vector insert failed after its text write: stage deletes for the
      * uncommitted text documents in the same open transaction
@@ -627,10 +635,11 @@ public class HybridIndex<T> private constructor(
     }
 
     /**
-     * The generation the next publish will use, verified against the Long
-     * domain before anything mutates — like [mintableDocId], the counter must
-     * never wrap: a wrapped negative generation would commit Tantivy and then
-     * publish metadata every later [load] rejects as corrupt.
+     * Reserves the generation the next publish will use. Publishing callers
+     * invoke this before their first text/vector/id mutation, then pass the
+     * result unchanged to [commitLocked]. Like [mintableDocId], the counter
+     * must never wrap: a wrapped negative generation would commit Tantivy and
+     * then publish metadata every later [load] rejects as corrupt.
      */
     private fun mintableGeneration(): Long {
         check(generation != Long.MAX_VALUE) {
@@ -640,28 +649,29 @@ public class HybridIndex<T> private constructor(
     }
 
     /**
-     * The publish protocol behind every durable state change: dump the new
-     * vector generation, commit Tantivy, atomically publish metadata naming
-     * both, then sweep older generations. A crash before the publish leaves
-     * the previous generation intact (the new files are sweepable strays); a
-     * crash after Tantivy's commit but before the publish is detected on load
-     * as [HybridSearchException.TornCommit].
+     * The publish protocol behind every durable state change. Compound callers
+     * pass a [reservedGeneration] obtained before they mutate; a direct
+     * [commit] reserves here before the dump. The protocol dumps that vector
+     * generation, commits Tantivy, atomically publishes metadata naming both,
+     * then sweeps older generations. A crash before the publish leaves the
+     * previous generation intact (the new files are sweepable strays); a crash
+     * after Tantivy's commit but before the publish is detected on load as
+     * [HybridSearchException.TornCommit].
      */
-    private suspend fun commitLocked() {
-        val newGeneration = mintableGeneration()
-        persistHnswLocked(newGeneration)
+    private suspend fun commitLocked(reservedGeneration: Long = mintableGeneration()) {
+        persistHnswLocked(reservedGeneration)
         tantivyIndex.commit()
-        generation = newGeneration
+        generation = reservedGeneration
         persistMetadataLocked()
         hnswIndex.setSearchingMode(true)
-        sweepHnswFiles(baseDir, keep = if (hasVectorGraph) hnswBasename(newGeneration) else null)
+        sweepHnswFiles(baseDir, keep = if (hasVectorGraph) hnswBasename(reservedGeneration) else null)
     }
 
-    private suspend fun deleteLocked(docId: Long, persist: Boolean) {
+    private suspend fun deleteLocked(docId: Long, reservedGeneration: Long?) {
         tantivyIndex.deleteDoc(DOC_ID_FIELD, TantivyValue.U64(docId))
         hnswIndex.delete(docId)
-        if (persist) {
-            commitLocked()
+        if (reservedGeneration != null) {
+            commitLocked(reservedGeneration)
         }
     }
 
