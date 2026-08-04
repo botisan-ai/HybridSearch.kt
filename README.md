@@ -14,6 +14,10 @@ GitHub Release assets per version (see the tantivy.kt README for the repo-setup 
 - `hybridsearch-android-<version>-maven.zip` — Maven-layout repo whose zip root **is** the repository root (`ai/botisan/...`); unzipping it (plus the tantivy/hnsw zips) and pointing Gradle at the folders resolves everything transitively.
 - `hybridsearch-android-<version>.aar` + `.sha256` files.
 
+Android support starts at minSdk 24. HybridSearch is pure Kotlin, while its
+Tantivy and HNSW dependencies supply 64-bit native libraries for `arm64-v8a`
+and `x86_64`; no other ABIs are packaged.
+
 ```kotlin
 dependencies { implementation("ai.botisan:hybridsearch-android:<version>") }
 ```
@@ -70,9 +74,8 @@ Contract notes:
 ./bootstrap-deps.sh                 # fetch sibling release repos (or build ../tantivy.kt + ../HNSW.kt locally)
 cd android && ./gradlew test        # host-JVM suite (needs sibling checkouts' host dylibs for JNA)
 cd android && ./gradlew lintRelease # release lint gate (also runs inside gh-release.sh)
-./gh-release.sh                     # bootstrap released deps -> test + lint + assemble -> consumer-resolution
-                                    # gate (the staged zip + downloaded dep repos resolved by a cache-isolated
-                                    # generated AGP consumer) -> GitHub Release with maven.zip + aar + sha256
+./gh-release.sh                     # bootstrap released deps -> test/lint/assemble -> APK 16 KB gate
+                                    # -> cache-isolated consumer resolution -> GitHub Release assets
 ```
 
 Host-JVM tests load the sibling repos' host dylibs via `jna.library.path`; build them once with `cargo build --release` in each sibling's `rust/`.
